@@ -1,0 +1,4 @@
+{
+  "Lua.workspace.library": ["${addons}/xmake/module/library"],
+  "Lua.workspace.checkThirdParty": false
+}

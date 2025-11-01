@@ -1,0 +1,39 @@
+LIBRARY 
+EXPORTS
+  ActivateAudioInterfaceAsync=ActivateAudioInterfaceAsync_wrapper @17
+  DllCanUnloadNow=DllCanUnloadNow_wrapper @35
+  DllGetClassObject=DllGetClassObject_wrapper @36
+  DllRegisterServer=DllRegisterServer_wrapper @37
+  DllUnregisterServer=DllUnregisterServer_wrapper @38
+  ExportByOrdinal2 @2 NONAME
+  ExportByOrdinal3 @3 NONAME
+  ExportByOrdinal4 @4 NONAME
+  ExportByOrdinal5 @5 NONAME
+  ExportByOrdinal6 @6 NONAME
+  ExportByOrdinal7 @7 NONAME
+  ExportByOrdinal8 @8 NONAME
+  ExportByOrdinal9 @9 NONAME
+  ExportByOrdinal10 @10 NONAME
+  ExportByOrdinal11 @11 NONAME
+  ExportByOrdinal12 @12 NONAME
+  ExportByOrdinal13 @13 NONAME
+  ExportByOrdinal14 @14 NONAME
+  ExportByOrdinal15 @15 NONAME
+  ExportByOrdinal16 @16 NONAME
+  ExportByOrdinal18 @18 NONAME
+  ExportByOrdinal19 @19 NONAME
+  ExportByOrdinal20 @20 NONAME
+  ExportByOrdinal21 @21 NONAME
+  ExportByOrdinal22 @22 NONAME
+  ExportByOrdinal23 @23 NONAME
+  ExportByOrdinal24 @24 NONAME
+  ExportByOrdinal25 @25 NONAME
+  ExportByOrdinal26 @26 NONAME
+  ExportByOrdinal27 @27 NONAME
+  ExportByOrdinal28 @28 NONAME
+  ExportByOrdinal29 @29 NONAME
+  ExportByOrdinal30 @30 NONAME
+  ExportByOrdinal31 @31 NONAME
+  ExportByOrdinal32 @32 NONAME
+  ExportByOrdinal33 @33 NONAME
+  ExportByOrdinal34 @34 NONAME
