@@ -1,5 +1,10 @@
 SPEEDUP = 2.0
 
+set_encodings("utf-8")
+set_policy("build.warning", true)
+set_languages("c++20")
+set_optimize("fastest")
+
 target("mmdevapi_x64")
 set_kind("shared")
 set_arch("x64")
