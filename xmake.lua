@@ -25,19 +25,15 @@ if is_arch("x64") then
 end
 add_links("ole32", "user32")
 add_defines("SPEEDUP=" .. SPEEDUP)
+add_packages("soundtouch")
 
-target("dsound_x64")
+target("dsound")
 set_kind("shared")
-set_arch("x64")
-set_filename("dsound-win64-" .. SPEEDUP .. ".dll")
-add_files("dsound/x64/dsound.cpp", "dsound/x64/dsound.def", "dsound/x64/dsound_asm.asm")
+set_filename("dsound-" .. ARCH .. "-" .. SPEEDUP .. ".dll")
+add_files("dsound/" .. ARCH .. "/dsound.cpp", "dsound/" .. ARCH .. "/dsound.def")
+if is_arch("x64") then
+	add_files("dsound/" .. ARCH .. "/dsound_asm.asm")
+end
 add_links("ole32", "user32", "dsound", "dxguid")
 add_defines("SPEEDUP=" .. SPEEDUP)
-
-target("dsound_x86")
-set_kind("shared")
-set_arch("x86")
-set_filename("dsound-win32-" .. SPEEDUP .. ".dll")
-add_files("dsound/x86/dsound.cpp", "dsound/x86/dsound.def")
-add_links("ole32", "user32", "dsound", "dxguid")
-add_defines("SPEEDUP=" .. SPEEDUP)
+add_packages("soundtouch")
