@@ -1,10 +1,12 @@
-
 #include <windows.h>
 
 #include <audioclient.h>
 #include <cstdio>
 #include <initguid.h>
 #include <mmdeviceapi.h>
+#include <vector>
+
+#include <soundtouch/SoundTouch.h>
 
 HINSTANCE mHinst = 0, mHinstDLL = 0;
 
@@ -57,8 +59,10 @@ inline void log_info(const char *info) {}
 #else
 FILE *debug;
 inline void log_info(const char *info) {
-  fprintf(debug, "%s\n", info);
-  fflush(debug);
+  if (debug) {
+    fprintf(debug, "%s\n", info);
+    fflush(debug);
+  }
 }
 #endif
 
@@ -71,35 +75,159 @@ DEFINE_GUID(IID_IAudioClient, 0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 0x78, 0xC2,
             0xF5, 0x68, 0xA7, 0x03, 0xB2);
 DEFINE_GUID(IID_IMMDevice, 0xD666063F, 0x1587, 0x4E43, 0x81, 0xF1, 0xB9, 0x48,
             0xE8, 0x07, 0x36, 0x3F);
+DEFINE_GUID(IID_IAudioRenderClient, 0xF294ACFC, 0x3146, 0x4483, 0xA7, 0xBF,
+            0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2);
 
-// --- 核心修改逻辑 ---
-void ModifyWaveFormatForSpeedup(WAVEFORMATEX *fmt) {
-  if (!fmt)
-    return;
-  fmt->nSamplesPerSec = (DWORD)((double)fmt->nSamplesPerSec * SPEEDUP);
-  fmt->nAvgBytesPerSec = (DWORD)((double)fmt->nAvgBytesPerSec * SPEEDUP);
-}
+// --- 数据处理层: 伪造的 IAudioRenderClient ---
+class FakeAudioRenderClient : public IAudioRenderClient {
+private:
+  IAudioRenderClient *m_pRealRenderClient;
+  LONG m_cRef;
+  soundtouch::SoundTouch *m_pSoundTouch;
+  WAVEFORMATEX *m_pFormat;
+  BYTE *m_pInputBuffer; // 我们提供给应用程序的缓冲区
+  UINT32 m_inputBufferSizeInFrames;
 
-void RevertWaveFormatFromSpeedup(WAVEFORMATEX *fmt) {
-  if (!fmt)
-    return;
-  fmt->nSamplesPerSec = (DWORD)((double)fmt->nSamplesPerSec / SPEEDUP);
-  fmt->nAvgBytesPerSec = (DWORD)((double)fmt->nAvgBytesPerSec / SPEEDUP);
-}
+public:
+  FakeAudioRenderClient(IAudioRenderClient *pReal, const WAVEFORMATEX *pFormat,
+                        UINT32 bufferSizeInFrames)
+      : m_pRealRenderClient(pReal), m_cRef(1), m_pSoundTouch(nullptr),
+        m_pFormat(nullptr), m_pInputBuffer(nullptr),
+        m_inputBufferSizeInFrames(0) {
+    m_pRealRenderClient->AddRef();
 
-// --- 伪造的 IAudioClient ---
+    size_t fmt_size = sizeof(WAVEFORMATEX) + pFormat->cbSize;
+    m_pFormat = (WAVEFORMATEX *)malloc(fmt_size);
+    if (m_pFormat) {
+      memcpy(m_pFormat, pFormat, fmt_size);
+    }
+
+    m_pSoundTouch = new soundtouch::SoundTouch();
+    m_pSoundTouch->setSampleRate(m_pFormat->nSamplesPerSec);
+    m_pSoundTouch->setChannels(m_pFormat->nChannels);
+    m_pSoundTouch->setTempo(SPEEDUP);
+
+    m_inputBufferSizeInFrames = bufferSizeInFrames;
+    m_pInputBuffer =
+        new BYTE[m_inputBufferSizeInFrames * m_pFormat->nBlockAlign];
+  }
+
+  virtual ~FakeAudioRenderClient() {
+    if (m_pRealRenderClient)
+      m_pRealRenderClient->Release();
+    if (m_pSoundTouch)
+      delete m_pSoundTouch;
+    if (m_pFormat)
+      free(m_pFormat);
+    if (m_pInputBuffer)
+      delete[] m_pInputBuffer;
+  }
+
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) {
+    if (riid == IID_IUnknown || riid == IID_IAudioRenderClient) {
+      *ppv = static_cast<IAudioRenderClient *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = NULL;
+    return m_pRealRenderClient->QueryInterface(riid, ppv);
+  }
+
+  STDMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&m_cRef); }
+
+  STDMETHODIMP_(ULONG) Release() {
+    ULONG ulRef = InterlockedDecrement(&m_cRef);
+    if (0 == ulRef)
+      delete this;
+    return ulRef;
+  }
+
+  STDMETHODIMP GetBuffer(UINT32 NumFramesRequested, BYTE **ppData) {
+    if (!ppData)
+      return E_POINTER;
+    if (NumFramesRequested > m_inputBufferSizeInFrames) {
+      *ppData = NULL;
+      return AUDCLNT_E_BUFFER_TOO_LARGE;
+    }
+    *ppData = m_pInputBuffer;
+    return S_OK;
+  }
+
+  STDMETHODIMP ReleaseBuffer(UINT32 NumFramesWritten, DWORD dwFlags) {
+    if (NumFramesWritten == 0) {
+      return m_pRealRenderClient->ReleaseBuffer(0, dwFlags);
+    }
+
+    // SoundTouch 内部使用 float 处理，这里假设输入也是 float。
+    // 如果是其他格式 (如 16-bit PCM), 需要在此处进行转换。
+    bool isFloat = (m_pFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+                    (m_pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                     ((WAVEFORMATEXTENSIBLE *)m_pFormat)->SubFormat ==
+                         KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
+
+    if (!isFloat || m_pFormat->wBitsPerSample != 32) {
+      log_info("Unsupported format for processing. Passing silence.");
+      BYTE *pRealBuffer = NULL;
+      UINT32 padding = 0;
+      // 尝试获取一个缓冲区来填充静音，以避免音频中断
+      HRESULT hr =
+          m_pRealRenderClient->GetBuffer(NumFramesWritten, &pRealBuffer);
+      if (SUCCEEDED(hr)) {
+        m_pRealRenderClient->ReleaseBuffer(NumFramesWritten,
+                                           AUDCLNT_BUFFERFLAGS_SILENT);
+      }
+      return S_OK;
+    }
+
+    // 1. 将应用程序写入的数据送入 SoundTouch
+    m_pSoundTouch->putSamples((const soundtouch::SAMPLETYPE *)m_pInputBuffer,
+                              NumFramesWritten);
+
+    // 2. 从 SoundTouch 中取出处理后的数据，并写入真实设备
+    UINT32 framesAvailable;
+    std::vector<soundtouch::SAMPLETYPE> outputBuffer(8192 *
+                                                     m_pFormat->nChannels);
+
+    do {
+      framesAvailable = m_pSoundTouch->receiveSamples(
+          outputBuffer.data(), outputBuffer.size() / m_pFormat->nChannels);
+
+      if (framesAvailable > 0) {
+        BYTE *pRealBuffer = NULL;
+        HRESULT hr =
+            m_pRealRenderClient->GetBuffer(framesAvailable, &pRealBuffer);
+        if (SUCCEEDED(hr)) {
+          memcpy(pRealBuffer, outputBuffer.data(),
+                 framesAvailable * m_pFormat->nBlockAlign);
+          m_pRealRenderClient->ReleaseBuffer(framesAvailable, 0);
+        } else {
+          log_info("Failed to get real buffer. Dropping processed samples.");
+        }
+      }
+    } while (m_pSoundTouch->numSamples() >=
+             64); // 循环直到SoundTouch内部缓冲减少
+
+    return S_OK;
+  }
+};
+
+// --- 控制层: 伪造的 IAudioClient ---
 class FakeAudioClient : public IAudioClient {
 private:
   IAudioClient *m_pRealAudioClient;
   LONG m_cRef;
+  WAVEFORMATEX *m_pClientFormat;
 
 public:
-  FakeAudioClient(IAudioClient *pReal) : m_pRealAudioClient(pReal), m_cRef(1) {
+  FakeAudioClient(IAudioClient *pReal)
+      : m_pRealAudioClient(pReal), m_cRef(1), m_pClientFormat(nullptr) {
     m_pRealAudioClient->AddRef();
   }
   virtual ~FakeAudioClient() {
     if (m_pRealAudioClient)
       m_pRealAudioClient->Release();
+    if (m_pClientFormat)
+      free(m_pClientFormat);
   }
   STDMETHODIMP QueryInterface(REFIID riid, void **ppv) {
     if (riid == IID_IUnknown || riid == IID_IAudioClient) {
@@ -122,67 +250,81 @@ public:
                           REFERENCE_TIME hnsPeriodicity,
                           const WAVEFORMATEX *pFormat,
                           LPCGUID AudioSessionGuid) {
-    WAVEFORMATEX *modified_fmt = NULL;
-    if (pFormat) {
-      size_t fmt_size = sizeof(WAVEFORMATEX) + pFormat->cbSize;
-      modified_fmt = (WAVEFORMATEX *)malloc(fmt_size);
-      if (!modified_fmt)
-        return E_OUTOFMEMORY;
-      memcpy(modified_fmt, pFormat, fmt_size);
-      ModifyWaveFormatForSpeedup(modified_fmt);
-    }
-    REFERENCE_TIME modified_duration =
-        (REFERENCE_TIME)((double)hnsBufferDuration / SPEEDUP);
-    REFERENCE_TIME modified_period =
-        (REFERENCE_TIME)((double)hnsPeriodicity / SPEEDUP);
     HRESULT hr = m_pRealAudioClient->Initialize(
-        ShareMode, StreamFlags, modified_duration, modified_period,
-        modified_fmt, AudioSessionGuid);
-    if (modified_fmt)
-      free(modified_fmt);
+        ShareMode, StreamFlags, hnsBufferDuration, hnsPeriodicity, pFormat,
+        AudioSessionGuid);
+
+    if (SUCCEEDED(hr) && pFormat) {
+      if (m_pClientFormat)
+        free(m_pClientFormat);
+      size_t fmt_size = sizeof(WAVEFORMATEX) + pFormat->cbSize;
+      m_pClientFormat = (WAVEFORMATEX *)malloc(fmt_size);
+      if (m_pClientFormat) {
+        memcpy(m_pClientFormat, pFormat, fmt_size);
+      } else {
+        return E_OUTOFMEMORY;
+      }
+    }
     return hr;
   }
   STDMETHODIMP IsFormatSupported(AUDCLNT_SHAREMODE ShareMode,
                                  const WAVEFORMATEX *pFormat,
                                  WAVEFORMATEX **ppClosestMatch) {
-    WAVEFORMATEX *modified_fmt = NULL;
-    if (pFormat) {
-      size_t fmt_size = sizeof(WAVEFORMATEX) + pFormat->cbSize;
-      modified_fmt = (WAVEFORMATEX *)malloc(fmt_size);
-      if (!modified_fmt)
-        return E_OUTOFMEMORY;
-      memcpy(modified_fmt, pFormat, fmt_size);
-      ModifyWaveFormatForSpeedup(modified_fmt);
-    }
-    HRESULT hr = m_pRealAudioClient->IsFormatSupported(ShareMode, modified_fmt,
-                                                       ppClosestMatch);
-    if (modified_fmt)
-      free(modified_fmt);
-    if (hr == S_FALSE && ppClosestMatch && *ppClosestMatch) {
-      RevertWaveFormatFromSpeedup(*ppClosestMatch);
-    }
-    return hr;
+    return m_pRealAudioClient->IsFormatSupported(ShareMode, pFormat,
+                                                 ppClosestMatch);
   }
   STDMETHODIMP GetMixFormat(WAVEFORMATEX **ppDeviceFormat) {
-    HRESULT hr = m_pRealAudioClient->GetMixFormat(ppDeviceFormat);
-    if (SUCCEEDED(hr) && ppDeviceFormat && *ppDeviceFormat) {
-      RevertWaveFormatFromSpeedup(*ppDeviceFormat);
-    }
-    return hr;
+    return m_pRealAudioClient->GetMixFormat(ppDeviceFormat);
   }
-  // --- 其他 IAudioClient 方法 (直接转发) ---
+
+  STDMETHODIMP GetService(REFIID riid, void **ppv) {
+    if (riid == IID_IAudioRenderClient) {
+      IAudioRenderClient *pRealRenderClient = NULL;
+      HRESULT hr =
+          m_pRealAudioClient->GetService(riid, (void **)&pRealRenderClient);
+      if (SUCCEEDED(hr)) {
+        if (!m_pClientFormat) {
+          pRealRenderClient->Release();
+          return E_UNEXPECTED;
+        }
+        UINT32 bufferSize = 0;
+        m_pRealAudioClient->GetBufferSize(&bufferSize);
+        *ppv = new FakeAudioRenderClient(pRealRenderClient, m_pClientFormat,
+                                         bufferSize);
+        pRealRenderClient->Release();
+      }
+      return hr;
+    }
+    return m_pRealAudioClient->GetService(riid, ppv);
+  }
+
   STDMETHODIMP GetBufferSize(UINT32 *pNumBufferFrames) {
     return m_pRealAudioClient->GetBufferSize(pNumBufferFrames);
   }
+
   STDMETHODIMP GetStreamLatency(REFERENCE_TIME *phnsLatency) {
-    return m_pRealAudioClient->GetStreamLatency(phnsLatency);
+    REFERENCE_TIME realLatency = 0;
+    HRESULT hr = m_pRealAudioClient->GetStreamLatency(&realLatency);
+    if (SUCCEEDED(hr) && phnsLatency) {
+      *phnsLatency = (REFERENCE_TIME)((double)realLatency / SPEEDUP);
+    }
+    return hr;
   }
+
+  // --- 欺骗应用程序，让它加速提供数据 ---
   STDMETHODIMP GetCurrentPadding(UINT32 *pNumPaddingFrames) {
-    return m_pRealAudioClient->GetCurrentPadding(pNumPaddingFrames);
+    if (!pNumPaddingFrames)
+      return E_POINTER;
+    UINT32 realPadding = 0;
+    HRESULT hr = m_pRealAudioClient->GetCurrentPadding(&realPadding);
+    if (SUCCEEDED(hr)) {
+      // 返回一个按比例缩小的Padding值
+      // 这会让应用程序认为缓冲区消耗得更快，从而更频繁地提供数据
+      *pNumPaddingFrames = (UINT32)((double)realPadding / SPEEDUP);
+    }
+    return hr;
   }
-  STDMETHODIMP GetService(REFIID riid, void **ppv) {
-    return m_pRealAudioClient->GetService(riid, ppv);
-  }
+
   STDMETHODIMP Start(void) { return m_pRealAudioClient->Start(); }
   STDMETHODIMP Stop(void) { return m_pRealAudioClient->Stop(); }
   STDMETHODIMP Reset(void) { return m_pRealAudioClient->Reset(); }
@@ -191,12 +333,21 @@ public:
   }
   STDMETHODIMP GetDevicePeriod(REFERENCE_TIME *phnsDefaultDevicePeriod,
                                REFERENCE_TIME *phnsMinimumDevicePeriod) {
-    return m_pRealAudioClient->GetDevicePeriod(phnsDefaultDevicePeriod,
-                                               phnsMinimumDevicePeriod);
+    HRESULT hr = m_pRealAudioClient->GetDevicePeriod(phnsDefaultDevicePeriod,
+                                                     phnsMinimumDevicePeriod);
+    if (SUCCEEDED(hr)) {
+      if (phnsDefaultDevicePeriod)
+        *phnsDefaultDevicePeriod =
+            (REFERENCE_TIME)((double)*phnsDefaultDevicePeriod / SPEEDUP);
+      if (phnsMinimumDevicePeriod)
+        *phnsMinimumDevicePeriod =
+            (REFERENCE_TIME)((double)*phnsMinimumDevicePeriod / SPEEDUP);
+    }
+    return hr;
   }
 };
 
-// --- 伪造的 IMMDevice ---
+// --- 伪造的 IMMDevice (与之前相同) ---
 class FakeDevice : public IMMDevice {
 private:
   IMMDevice *m_pRealDevice;
@@ -234,8 +385,7 @@ public:
         *ppInterface) {
       IAudioClient *pRealClient = (IAudioClient *)*ppInterface;
       *ppInterface = new FakeAudioClient(pRealClient);
-      pRealClient
-          ->Release(); // FakeAudioClient 已经 AddRef, 所以这里可以 Release
+      pRealClient->Release();
     }
     return hr;
   }
@@ -249,7 +399,7 @@ public:
   }
 };
 
-// --- 伪造的 IMMDeviceEnumerator ---
+// --- 伪造的 IMMDeviceEnumerator (与之前相同) ---
 class FakeDeviceEnumerator : public IMMDeviceEnumerator {
 private:
   IMMDeviceEnumerator *m_pRealEnumerator;
@@ -315,7 +465,7 @@ public:
   }
 };
 
-// --- 伪造的 IClassFactory ---
+// --- 伪造的 IClassFactory (与之前相同) ---
 class FakeClassFactory : public IClassFactory {
 private:
   IClassFactory *m_pRealFactory;
@@ -361,68 +511,34 @@ public:
   }
 };
 
-// --- Hook 核心: 伪造 DllGetClassObject ---
-
-// 激活对 DllGetClassObject 的 Hook
+// --- Hook 核心: 伪造 DllGetClassObject (与之前相同) ---
 #define DLLGETCLASSOBJECT
-
-// 定义 DllGetClassObject 函数指针类型
 typedef HRESULT(WINAPI *DllGetClassObject_ptr)(REFCLSID, REFIID, LPVOID *);
-// 定义一个变量来保存原始 DllGetClassObject 函数的地址
 DllGetClassObject_ptr DllGetClassObject_real = NULL;
 
-// 我们伪造的 DllGetClassObject 函数
 HRESULT WINAPI DllGetClassObject_fake(REFCLSID rclsid, REFIID riid,
                                       LPVOID *ppv) {
-  // 首先，调用原始的 DllGetClassObject 函数
   HRESULT hr = DllGetClassObject_real(rclsid, riid, ppv);
-
-  // 如果调用成功，并且请求的是 MMDeviceEnumerator 的类厂
   if (SUCCEEDED(hr) && rclsid == CLSID_MMDeviceEnumerator) {
-    // 替换返回的类厂为我们伪造的类厂
     IClassFactory *pRealFactory = (IClassFactory *)*ppv;
     *ppv = new FakeClassFactory(pRealFactory);
-    pRealFactory
-        ->Release(); // FakeClassFactory 已经 AddRef, 所以这里可以 Release
+    pRealFactory->Release();
   }
   return hr;
 }
 
-// =================================================================
-// ========= 核心逻辑迁移结束 ENDS HERE ==========================
-// =================================================================
-
-// _hook_setup 函数将根据上面定义的宏 (例如 DLLGETCLASSOBJECT)
-// 自动将 mProcs 数组中的指针替换为我们的 fake 函数
+// --- _hook_setup 和 DllMain (与之前相同) ---
 inline void _hook_setup() {
-#ifdef ACTIVATEAUDIOINTERFACEASYNC
-  ActivateAudioInterfaceAsync_real = (ActivateAudioInterfaceAsync_ptr)mProcs[0];
-  mProcs[0] = (UINT_PTR)&ActivateAudioInterfaceAsync_fake;
-#endif
-#ifdef DLLCANUNLOADNOW
-  DllCanUnloadNow_real = (DllCanUnloadNow_ptr)mProcs[1];
-  mProcs[1] = (UINT_PTR)&DllCanUnloadNow_fake;
-#endif
 #ifdef DLLGETCLASSOBJECT
   DllGetClassObject_real = (DllGetClassObject_ptr)mProcs[2];
   mProcs[2] = (UINT_PTR)&DllGetClassObject_fake;
 #endif
-#ifdef DLLREGISTERSERVER
-  DllRegisterServer_real = (DllRegisterServer_ptr)mProcs[3];
-  mProcs[3] = (UINT_PTR)&DllRegisterServer_fake;
-#endif
-#ifdef DLLUNREGISTERSERVER
-  DllUnregisterServer_real = (DllUnregisterServer_ptr)mProcs[4];
-  mProcs[4] = (UINT_PTR)&DllUnregisterServer_fake;
-#endif
-  // ... 其他函数的宏判断 ...
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
   mHinst = hinstDLL;
   if (fdwReason == DLL_PROCESS_ATTACH) {
     mHinstDLL = LoadLibraryA("real_mmdevapi.dll");
-
     if (!mHinstDLL) {
       return FALSE;
     }
@@ -432,10 +548,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     _hook_setup();
 #ifdef _DEBUG
     debug = fopen("./debug.log", "a");
+    log_info("--- DLL Attached ---");
 #endif
   } else if (fdwReason == DLL_PROCESS_DETACH) {
 #ifdef _DEBUG
-    fclose(debug);
+    log_info("--- DLL Detached ---");
+    if (debug)
+      fclose(debug);
 #endif
     FreeLibrary(mHinstDLL);
   }
