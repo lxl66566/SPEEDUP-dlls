@@ -421,7 +421,7 @@ inline void _hook_setup() {
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
   mHinst = hinstDLL;
   if (fdwReason == DLL_PROCESS_ATTACH) {
-    mHinstDLL = LoadLibraryA("real_mmdevapi.dll");
+    mHinstDLL = LoadLibraryA("C:\\Windows\\System32\\MMDevAPI.dll");
 
     if (!mHinstDLL) {
       return FALSE;

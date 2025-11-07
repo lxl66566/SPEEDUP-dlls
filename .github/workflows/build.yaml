@@ -1,0 +1,84 @@
+name: Build and Release C++ Project
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*"
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Build loop for different SPEEDUP values
+        run: |
+          # 备份原始的 xmake.lua 文件
+          cp xmake.lua xmake.lua.bak
+
+          # 定义一个包含所有 SPEEDUP 值的数组
+          SPEEDUP_VALUES=("1.0" "1.1" "1.2" "1.3" "1.4" "1.5" "1.6" "1.7" "1.8" "1.9" "2.0" "2.1" "2.2" "2.3" "2.4" "2.5")
+
+          # 遍历数组中的每一个值
+          for SPEEDUP in "${SPEEDUP_VALUES[@]}"; do
+            echo "--- Building for SPEEDUP = $SPEEDUP ---"
+
+            # 恢复原始 xmake.lua，以确保 sed 替换的准确性
+            cp xmake.lua.bak xmake.lua
+            # 使用 sed 将 "SPEEDUP = 2.0" 替换为当前的 SPEEDUP 值
+            sed -i "s/SPEEDUP = [0-9.]*/SPEEDUP = ${SPEEDUP}/" xmake.lua
+
+            # 构建 x64 版本
+            echo "Building x64 for SPEEDUP ${SPEEDUP}..."
+            xmake f -c -p windows -a x64 --toolchain=msvc
+            xmake
+
+            # 构建 x86 版本
+            echo "Building x86 for SPEEDUP ${SPEEDUP}..."
+            xmake f -c -p windows -a x86 --toolchain=msvc
+            xmake
+          done
+
+          # 恢复原始的 xmake.lua 文件，保持仓库干净
+          mv xmake.lua.bak xmake.lua
+
+      # 步骤 5: 将所有生成的 DLL 打包
+      - uses: milliewalky/setup-7-zip@v2
+      - name: Package all DLLs into a 7z archive
+        run: |
+          7z a -t7z -mx=9 MMDevAPI-DLLs.7z ./build/windows/x64/release/*.dll ./build/windows/x86/release/*.dll
+
+      # 步骤 6: 上传构建产物 (Artifact)
+      # 无论何时运行，都会执行此步骤
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v5
+        with:
+          # Artifact 的名称
+          name: MMDevAPI-DLLs
+          # 需要上传的文件的路径
+          path: MMDevAPI-DLLs.7z
+
+      # 步骤 7: 如果是 tag 触发，则上传到 Release
+      # 仅在事件是由一个 tag (例如 v1.0.0) 触发时运行
+      - name: Upload to Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          # 需要上传的文件列表
+          files: MMDevAPI-DLLs.7z

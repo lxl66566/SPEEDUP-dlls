@@ -368,7 +368,7 @@ LPCSTR mImportNames[] = {
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
   if (fdwReason == DLL_PROCESS_ATTACH) {
-    hRealDll = LoadLibraryA("real_mmdevapi.dll");
+    hRealDll = LoadLibraryA("C:\\Windows\\SysWOW64\\MMDevAPI.dll");
     if (!hRealDll) {
       return FALSE;
     }

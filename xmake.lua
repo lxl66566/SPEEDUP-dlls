@@ -9,7 +9,6 @@ set_encodings("utf-8")
 set_policy("build.warning", true)
 set_languages("c++20")
 set_optimize("fastest")
-add_requires("soundtouch")
 -- add_requires("soundtouch", { configs = { shared = true } })
 
 target("mmdevapi")
