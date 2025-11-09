@@ -20,3 +20,12 @@ if is_arch("x64") then
 end
 add_links("ole32", "user32")
 add_defines("SPEEDUP=" .. SPEEDUP)
+
+target("winmm")
+set_kind("shared")
+set_filename("winmm-" .. ARCH .. "-" .. SPEEDUP .. ".dll")
+add_files("winmm/" .. ARCH .. "/winmm.cpp", "winmm/" .. ARCH .. "/winmm.def")
+if is_arch("x64") then
+	add_files("winmm/" .. ARCH .. "/winmm_asm.asm")
+end
+add_defines("SPEEDUP=" .. SPEEDUP)
