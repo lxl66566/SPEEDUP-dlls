@@ -24,15 +24,15 @@ DEFINE_GUID(IID_IMMDeviceCollection, 0x0BD7A1BE, 0x7A1A, 0x44DB, 0x83, 0x97,
 void ModifyWaveFormatForSpeedup(WAVEFORMATEX *fmt) {
   if (!fmt)
     return;
-  fmt->nSamplesPerSec = (DWORD)((double)fmt->nSamplesPerSec * SPEEDUP);
-  fmt->nAvgBytesPerSec = (DWORD)((double)fmt->nAvgBytesPerSec * SPEEDUP);
+  fmt->nSamplesPerSec = (DWORD)((double)fmt->nSamplesPerSec * SPEEDUP + 0.5);
+  fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
 }
 
 void RevertWaveFormatFromSpeedup(WAVEFORMATEX *fmt) {
   if (!fmt)
     return;
-  fmt->nSamplesPerSec = (DWORD)((double)fmt->nSamplesPerSec / SPEEDUP);
-  fmt->nAvgBytesPerSec = (DWORD)((double)fmt->nAvgBytesPerSec / SPEEDUP);
+  fmt->nSamplesPerSec = (DWORD)((double)fmt->nSamplesPerSec / SPEEDUP + 0.5);
+  fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
 }
 
 class FakeAudioClock : public IAudioClock {
@@ -67,16 +67,15 @@ public:
   STDMETHODIMP GetFrequency(UINT64 *pu64Frequency) {
     HRESULT hr = m_pRealAudioClock->GetFrequency(pu64Frequency);
     if (SUCCEEDED(hr) && pu64Frequency) {
-      // 返回给应用程序一个被“欺骗”的频率
-      *pu64Frequency = (UINT64)((double)*pu64Frequency / SPEEDUP);
+      *pu64Frequency = (UINT64)((double)*pu64Frequency / SPEEDUP + 0.5);
     }
     return hr;
   }
+
   STDMETHODIMP GetPosition(UINT64 *pu64Position, UINT64 *pu64QPCPosition) {
     HRESULT hr = m_pRealAudioClock->GetPosition(pu64Position, pu64QPCPosition);
     if (SUCCEEDED(hr) && pu64Position) {
-      // 返回给应用程序一个被“欺骗”的位置
-      *pu64Position = (UINT64)((double)*pu64Position / SPEEDUP);
+      *pu64Position = (UINT64)((double)*pu64Position / SPEEDUP + 0.5);
     }
     return hr;
   }
@@ -120,23 +119,57 @@ public:
                           const WAVEFORMATEX *pFormat,
                           LPCGUID AudioSessionGuid) {
     WAVEFORMATEX *modified_fmt = NULL;
-    if (pFormat) {
-      size_t fmt_size = sizeof(WAVEFORMATEX) + pFormat->cbSize;
-      modified_fmt = (WAVEFORMATEX *)malloc(fmt_size);
-      if (!modified_fmt)
-        return E_OUTOFMEMORY;
-      memcpy(modified_fmt, pFormat, fmt_size);
-      ModifyWaveFormatForSpeedup(modified_fmt);
+    if (!pFormat) {
+      // 如果 pFormat 为空，直接透传
+      return m_pRealAudioClient->Initialize(ShareMode, StreamFlags,
+                                            hnsBufferDuration, hnsPeriodicity,
+                                            pFormat, AudioSessionGuid);
     }
+
+    // 准备被修改的格式
+    size_t fmt_size = sizeof(WAVEFORMATEX) + pFormat->cbSize;
+    modified_fmt = (WAVEFORMATEX *)malloc(fmt_size);
+    if (!modified_fmt)
+      return E_OUTOFMEMORY;
+    memcpy(modified_fmt, pFormat, fmt_size);
+
+    // 获取原始采样率，以供后续计算
+    DWORD originalSampleRate = pFormat->nSamplesPerSec;
+
+    // 使用我们更新后的函数修改格式
+    ModifyWaveFormatForSpeedup(modified_fmt);
+    DWORD newSampleRate = modified_fmt->nSamplesPerSec;
+
+    // 1. 计算应用程序期望的缓冲区帧数
+    UINT32 numBufferFrames =
+        (UINT32)((double)hnsBufferDuration * originalSampleRate / 10000000.0 +
+                 0.5);
+
+    // 2. 根据期望的帧数和新的采样率，反推出修改后的缓冲区时长
     REFERENCE_TIME modified_duration =
-        (REFERENCE_TIME)((double)hnsBufferDuration / SPEEDUP);
-    REFERENCE_TIME modified_period =
-        (REFERENCE_TIME)((double)hnsPeriodicity / SPEEDUP);
+        (REFERENCE_TIME)((double)numBufferFrames * 10000000.0 / newSampleRate +
+                         0.5);
+
+    REFERENCE_TIME modified_period = 0;
+    // 仅在 hnsPeriodicity 不为0时计算（0有特殊含义，表示自动选择）
+    if (hnsPeriodicity != 0) {
+      // 3. 计算应用程序期望的周期帧数
+      UINT32 numPeriodFrames =
+          (UINT32)((double)hnsPeriodicity * originalSampleRate / 10000000.0 +
+                   0.5);
+      // 4. 根据期望的帧数和新的采样率，反推出修改后的周期
+      modified_period = (REFERENCE_TIME)((double)numPeriodFrames * 10000000.0 /
+                                             newSampleRate +
+                                         0.5);
+    }
+
     HRESULT hr = m_pRealAudioClient->Initialize(
         ShareMode, StreamFlags, modified_duration, modified_period,
         modified_fmt, AudioSessionGuid);
+
     if (modified_fmt)
       free(modified_fmt);
+
     return hr;
   }
   STDMETHODIMP IsFormatSupported(AUDCLNT_SHAREMODE ShareMode,
