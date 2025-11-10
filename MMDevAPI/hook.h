@@ -16,8 +16,11 @@ DEFINE_GUID(IID_IAudioClient, 0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 0x78, 0xC2,
             0xF5, 0x68, 0xA7, 0x03, 0xB2);
 DEFINE_GUID(IID_IMMDevice, 0xD666063F, 0x1587, 0x4E43, 0x81, 0xF1, 0xB9, 0x48,
             0xE8, 0x07, 0x36, 0x3F);
+DEFINE_GUID(IID_IAudioClock, 0xCD63314F, 0x3F04, 0x4c06, 0x9F, 0x54, 0x77, 0xA7,
+            0x48, 0xAB, 0x3C, 0x68);
+DEFINE_GUID(IID_IMMDeviceCollection, 0x0BD7A1BE, 0x7A1A, 0x44DB, 0x83, 0x97,
+            0xCC, 0x53, 0x9C, 0xB3, 0x5D, 0x69);
 
-// --- 核心修改逻辑 ---
 void ModifyWaveFormatForSpeedup(WAVEFORMATEX *fmt) {
   if (!fmt)
     return;
@@ -32,7 +35,56 @@ void RevertWaveFormatFromSpeedup(WAVEFORMATEX *fmt) {
   fmt->nAvgBytesPerSec = (DWORD)((double)fmt->nAvgBytesPerSec / SPEEDUP);
 }
 
-// --- 伪造的 IAudioClient ---
+class FakeAudioClock : public IAudioClock {
+private:
+  IAudioClock *m_pRealAudioClock;
+  LONG m_cRef;
+
+public:
+  FakeAudioClock(IAudioClock *pReal) : m_pRealAudioClock(pReal), m_cRef(1) {
+    m_pRealAudioClock->AddRef();
+  }
+  virtual ~FakeAudioClock() {
+    if (m_pRealAudioClock)
+      m_pRealAudioClock->Release();
+  }
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) {
+    if (riid == IID_IUnknown || riid == IID_IAudioClock) {
+      *ppv = static_cast<IAudioClock *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = NULL;
+    return m_pRealAudioClock->QueryInterface(riid, ppv);
+  }
+  STDMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&m_cRef); }
+  STDMETHODIMP_(ULONG) Release() {
+    ULONG ulRef = InterlockedDecrement(&m_cRef);
+    if (0 == ulRef)
+      delete this;
+    return ulRef;
+  }
+  STDMETHODIMP GetFrequency(UINT64 *pu64Frequency) {
+    HRESULT hr = m_pRealAudioClock->GetFrequency(pu64Frequency);
+    if (SUCCEEDED(hr) && pu64Frequency) {
+      // 返回给应用程序一个被“欺骗”的频率
+      *pu64Frequency = (UINT64)((double)*pu64Frequency / SPEEDUP);
+    }
+    return hr;
+  }
+  STDMETHODIMP GetPosition(UINT64 *pu64Position, UINT64 *pu64QPCPosition) {
+    HRESULT hr = m_pRealAudioClock->GetPosition(pu64Position, pu64QPCPosition);
+    if (SUCCEEDED(hr) && pu64Position) {
+      // 返回给应用程序一个被“欺骗”的位置
+      *pu64Position = (UINT64)((double)*pu64Position / SPEEDUP);
+    }
+    return hr;
+  }
+  STDMETHODIMP GetCharacteristics(DWORD *pdwCharacteristics) {
+    return m_pRealAudioClock->GetCharacteristics(pdwCharacteristics);
+  }
+};
+
 class FakeAudioClient : public IAudioClient {
 private:
   IAudioClient *m_pRealAudioClient;
@@ -119,12 +171,27 @@ public:
     return m_pRealAudioClient->GetBufferSize(pNumBufferFrames);
   }
   STDMETHODIMP GetStreamLatency(REFERENCE_TIME *phnsLatency) {
-    return m_pRealAudioClient->GetStreamLatency(phnsLatency);
+    HRESULT hr = m_pRealAudioClient->GetStreamLatency(phnsLatency);
+    if (SUCCEEDED(hr) && phnsLatency) {
+      // 应用程序看到的时间应该是被拉长过的
+      *phnsLatency = (REFERENCE_TIME)((double)*phnsLatency * SPEEDUP);
+    }
+    return hr;
   }
   STDMETHODIMP GetCurrentPadding(UINT32 *pNumPaddingFrames) {
     return m_pRealAudioClient->GetCurrentPadding(pNumPaddingFrames);
   }
   STDMETHODIMP GetService(REFIID riid, void **ppv) {
+    if (riid == IID_IAudioClock) {
+      IAudioClock *pRealClock = NULL;
+      HRESULT hr = m_pRealAudioClient->GetService(riid, (void **)&pRealClock);
+      if (SUCCEEDED(hr) && pRealClock) {
+        *ppv = new FakeAudioClock(pRealClock);
+        pRealClock->Release();
+      }
+      return hr;
+    }
+    // 对于其他服务，直接透传
     return m_pRealAudioClient->GetService(riid, ppv);
   }
   STDMETHODIMP Start(void) { return m_pRealAudioClient->Start(); }
@@ -135,12 +202,23 @@ public:
   }
   STDMETHODIMP GetDevicePeriod(REFERENCE_TIME *phnsDefaultDevicePeriod,
                                REFERENCE_TIME *phnsMinimumDevicePeriod) {
-    return m_pRealAudioClient->GetDevicePeriod(phnsDefaultDevicePeriod,
-                                               phnsMinimumDevicePeriod);
+    HRESULT hr = m_pRealAudioClient->GetDevicePeriod(phnsDefaultDevicePeriod,
+                                                     phnsMinimumDevicePeriod);
+    if (SUCCEEDED(hr)) {
+      // 同样，应用程序看到的时间周期也应该是拉长过的
+      if (phnsDefaultDevicePeriod) {
+        *phnsDefaultDevicePeriod =
+            (REFERENCE_TIME)((double)*phnsDefaultDevicePeriod * SPEEDUP);
+      }
+      if (phnsMinimumDevicePeriod) {
+        *phnsMinimumDevicePeriod =
+            (REFERENCE_TIME)((double)*phnsMinimumDevicePeriod * SPEEDUP);
+      }
+    }
+    return hr;
   }
 };
 
-// --- 伪造的 IMMDevice ---
 class FakeDevice : public IMMDevice {
 private:
   IMMDevice *m_pRealDevice;
@@ -192,7 +270,51 @@ public:
   }
 };
 
-// --- 伪造的 IMMDeviceEnumerator ---
+class FakeDeviceCollection : public IMMDeviceCollection {
+private:
+  IMMDeviceCollection *m_pRealCollection;
+  LONG m_cRef;
+
+public:
+  FakeDeviceCollection(IMMDeviceCollection *pReal)
+      : m_pRealCollection(pReal), m_cRef(1) {
+    m_pRealCollection->AddRef();
+  }
+  virtual ~FakeDeviceCollection() {
+    if (m_pRealCollection)
+      m_pRealCollection->Release();
+  }
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) {
+    if (riid == IID_IUnknown || riid == IID_IMMDeviceCollection) {
+      *ppv = static_cast<IMMDeviceCollection *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = NULL;
+    return m_pRealCollection->QueryInterface(riid, ppv);
+  }
+  STDMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&m_cRef); }
+  STDMETHODIMP_(ULONG) Release() {
+    ULONG ulRef = InterlockedDecrement(&m_cRef);
+    if (0 == ulRef)
+      delete this;
+    return ulRef;
+  }
+  STDMETHODIMP GetCount(UINT *pcDevices) {
+    return m_pRealCollection->GetCount(pcDevices);
+  }
+  STDMETHODIMP Item(UINT nDevice, IMMDevice **ppDevice) {
+    HRESULT hr = m_pRealCollection->Item(nDevice, ppDevice);
+    if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
+      // 确保从集合中获取的设备也是伪造的
+      IMMDevice *pRealDevice = *ppDevice;
+      *ppDevice = new FakeDevice(pRealDevice);
+      pRealDevice->Release();
+    }
+    return hr;
+  }
+};
+
 class FakeDeviceEnumerator : public IMMDeviceEnumerator {
 private:
   IMMDeviceEnumerator *m_pRealEnumerator;
@@ -245,8 +367,14 @@ public:
   }
   STDMETHODIMP EnumAudioEndpoints(EDataFlow dataFlow, DWORD dwStateMask,
                                   IMMDeviceCollection **ppDevices) {
-    return m_pRealEnumerator->EnumAudioEndpoints(dataFlow, dwStateMask,
-                                                 ppDevices);
+    HRESULT hr =
+        m_pRealEnumerator->EnumAudioEndpoints(dataFlow, dwStateMask, ppDevices);
+    if (SUCCEEDED(hr) && ppDevices && *ppDevices) {
+      IMMDeviceCollection *pRealCollection = *ppDevices;
+      *ppDevices = new FakeDeviceCollection(pRealCollection);
+      pRealCollection->Release();
+    }
+    return hr;
   }
   STDMETHODIMP
   RegisterEndpointNotificationCallback(IMMNotificationClient *pClient) {
@@ -258,7 +386,6 @@ public:
   }
 };
 
-// --- 伪造的 IClassFactory ---
 class FakeClassFactory : public IClassFactory {
 private:
   IClassFactory *m_pRealFactory;
@@ -304,7 +431,6 @@ public:
   }
 };
 
-// --- Hook 核心: 伪造 DllGetClassObject ---
 #define DLLGETCLASSOBJECT
 
 FAKE(HRESULT, WINAPI, DllGetClassObject, REFCLSID rclsid, REFIID riid,
