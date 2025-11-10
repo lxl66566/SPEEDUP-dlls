@@ -20,3 +20,13 @@ if is_arch("x64") then
 end
 add_links("ole32", "user32")
 add_defines("SPEEDUP=" .. SPEEDUP)
+
+target("dsound")
+set_kind("shared")
+set_filename("dsound-" .. ARCH .. "-" .. SPEEDUP .. ".dll")
+add_files("dsound/" .. ARCH .. "/dsound.cpp", "dsound/" .. ARCH .. "/dsound.def")
+if is_arch("x64") then
+	add_files("dsound/" .. ARCH .. "/dsound_asm.asm")
+end
+add_links("ole32", "user32", "dsound", "dxguid")
+add_defines("SPEEDUP=" .. SPEEDUP)
