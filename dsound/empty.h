@@ -1,23 +1,30 @@
-// empty.h
-
 #ifndef _EMPTY_H
 #define _EMPTY_H
 
 #include <windows.h>
 
 #include <dsound.h>
+#include <malloc.h> // For _malloca and _freea
 #include <map>
 #include <utility>
 #include <vector>
 
-// [MODIFIED] 添加了 SetFormat 的 VTable 索引
+// --- VTable 索引 ---
+// 根据 dsound vtable 结构，添加了 GetFormat 和 GetFrequency 的索引
+constexpr int IUNKNOWN_QUERYINTERFACE_INDEX = 0;
+constexpr int IUNKNOWN_ADDREF_INDEX = 1;
 constexpr int IUNKNOWN_RELEASE_INDEX = 2;
+
 constexpr int IDIRECTSOUND_CREATESOUNDBUFFER_INDEX = 3;
+
+constexpr int IDIRECTSOUNDBUFFER_GETCAPS_INDEX = 3;
+constexpr int IDIRECTSOUNDBUFFER_GETCURRENTPOSITION_INDEX = 4;
+constexpr int IDIRECTSOUNDBUFFER_GETFORMAT_INDEX = 5;
+constexpr int IDIRECTSOUNDBUFFER_GETFREQUENCY_INDEX = 8;
 constexpr int IDIRECTSOUNDBUFFER_SETFORMAT_INDEX = 14;
 constexpr int IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX = 17;
 
 // --- 线程安全 ---
-// DirectSound 接口可能会被多个线程调用，必须保护我们的全局 Hook Map
 CRITICAL_SECTION g_cs;
 // 在 DllMain 的 DLL_PROCESS_ATTACH 中初始化: InitializeCriticalSection(&g_cs);
 // 在 DllMain 的 DLL_PROCESS_DETACH 中销毁: DeleteCriticalSection(&g_cs);
@@ -28,10 +35,14 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
                                       LPDIRECTSOUNDBUFFER *ppDSBuffer,
                                       LPUNKNOWN pUnkOuter);
 ULONG WINAPI DS_Release_fake(IDirectSound *pThis);
+
 HRESULT WINAPI SetFrequency_fake(IDirectSoundBuffer *pThis, DWORD dwFrequency);
-ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis);
-// [MODIFIED] 添加了 SetFormat_fake 的前向声明
 HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx);
+HRESULT WINAPI GetFrequency_fake(IDirectSoundBuffer *pThis,
+                                 LPDWORD pdwFrequency);
+HRESULT WINAPI GetFormat_fake(IDirectSoundBuffer *pThis, LPWAVEFORMATEX pwfx,
+                              DWORD dwSizeAllocated, LPDWORD pdwSizeWritten);
+ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis);
 
 // --- 用于存储 Hook 信息的结构体和全局 Map ---
 
@@ -46,11 +57,16 @@ std::map<IDirectSound *, DSoundHook> g_dsound_hooks;
 
 // IDirectSoundBuffer 接口的 Hook 数据
 struct DSoundBufferHook {
-  // [MODIFIED] 添加了 SetFormat 的原始函数指针
   HRESULT(WINAPI *SetFormat_orig)(IDirectSoundBuffer *, LPCWAVEFORMATEX);
   HRESULT(WINAPI *SetFrequency_orig)(IDirectSoundBuffer *, DWORD);
+  // [MODIFIED] 添加 GetFormat 和 GetFrequency 的原始函数指针
+  HRESULT(WINAPI *GetFormat_orig)(IDirectSoundBuffer *, LPWAVEFORMATEX, DWORD,
+                                  LPDWORD);
+  HRESULT(WINAPI *GetFrequency_orig)(IDirectSoundBuffer *, LPDWORD);
   ULONG(WINAPI *Release_orig)(IDirectSoundBuffer *);
-  DWORD original_frequency; // 存储缓冲区创建时的原始采样率
+
+  // [MODIFIED] 存储原始格式信息，用于“撒谎”
+  WAVEFORMATEX original_format;
   std::vector<void *> vtable_clone;
 };
 std::map<IDirectSoundBuffer *, DSoundBufferHook> g_dsound_buffer_hooks;
@@ -63,10 +79,15 @@ ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis) {
   auto it = g_dsound_buffer_hooks.find(pThis);
   if (it == g_dsound_buffer_hooks.end()) {
     LeaveCriticalSection(&g_cs);
+    // 可能是一个我们没有Hook的缓冲区（例如Primary Buffer），直接返回
+    // 理论上不应该发生，但作为保护
     return 1;
   }
 
+  // 调用原始 Release
   ULONG refCount = it->second.Release_orig(pThis);
+
+  // 如果引用计数为0，对象将被销毁，从我们的map中移除
   if (refCount == 0) {
     g_dsound_buffer_hooks.erase(it);
   }
@@ -74,8 +95,74 @@ ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis) {
   return refCount;
 }
 
-// [MODIFIED] 新增伪造的 IDirectSoundBuffer::SetFormat 函数
-// 目标：拦截 SetFormat 调用，修改其 WAVEFORMATEX 参数中的采样率
+// [NEW] 伪造的 IDirectSoundBuffer::GetFormat
+// 目标：向应用程序报告原始的、未经修改的音频格式
+HRESULT WINAPI GetFormat_fake(IDirectSoundBuffer *pThis, LPWAVEFORMATEX pwfx,
+                              DWORD dwSizeAllocated, LPDWORD pdwSizeWritten) {
+  EnterCriticalSection(&g_cs);
+  auto it = g_dsound_buffer_hooks.find(pThis);
+  if (it == g_dsound_buffer_hooks.end()) {
+    LeaveCriticalSection(&g_cs);
+    return DSERR_GENERIC;
+  }
+
+  // 先获取原始信息，以防万一
+  DSoundBufferHook &hook_data = it->second;
+  LeaveCriticalSection(&g_cs);
+
+  if (pwfx == nullptr && pdwSizeWritten == nullptr) {
+    return DSERR_INVALIDPARAM;
+  }
+
+  DWORD requiredSize = sizeof(WAVEFORMATEX) + hook_data.original_format.cbSize;
+
+  if (pdwSizeWritten) {
+    *pdwSizeWritten = requiredSize;
+  }
+
+  if (pwfx) {
+    if (dwSizeAllocated < requiredSize) {
+      // 缓冲区太小，无法写入完整的格式信息
+      return DSERR_INVALIDPARAM;
+    }
+    // 复制我们保存的原始格式信息给应用程序
+    memcpy(pwfx, &hook_data.original_format, requiredSize);
+  }
+
+  return DS_OK;
+}
+
+// [NEW] 伪造的 IDirectSoundBuffer::GetFrequency
+// 目标：向应用程序报告原始的、未经修改的频率
+HRESULT WINAPI GetFrequency_fake(IDirectSoundBuffer *pThis,
+                                 LPDWORD pdwFrequency) {
+  EnterCriticalSection(&g_cs);
+  auto it = g_dsound_buffer_hooks.find(pThis);
+  if (it == g_dsound_buffer_hooks.end()) {
+    LeaveCriticalSection(&g_cs);
+    return DSERR_GENERIC;
+  }
+
+  if (pdwFrequency == nullptr) {
+    LeaveCriticalSection(&g_cs);
+    return DSERR_INVALIDPARAM;
+  }
+
+  // 调用原始函数获取真实的、加速后的频率
+  DWORD realFrequency;
+  HRESULT hr = it->second.GetFrequency_orig(pThis, &realFrequency);
+  LeaveCriticalSection(&g_cs);
+
+  if (SUCCEEDED(hr)) {
+    // 计算出原始频率并返回
+    *pdwFrequency =
+        static_cast<DWORD>(static_cast<double>(realFrequency) / SPEEDUP);
+  }
+
+  return hr;
+}
+
+// 伪造的 IDirectSoundBuffer::SetFormat
 HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
@@ -90,7 +177,6 @@ HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   }
 
   // 创建 WAVEFORMATEX 的本地副本以进行修改
-  // 我们需要一个足够大的缓冲区来容纳可能的扩展部分 (pcfx->cbSize)
   size_t wfxSize = sizeof(WAVEFORMATEX) + pcfx->cbSize;
   WAVEFORMATEX *localWfx = (WAVEFORMATEX *)_malloca(wfxSize);
   if (!localWfx) {
@@ -99,14 +185,12 @@ HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   }
   memcpy(localWfx, pcfx, wfxSize);
 
-  // 更新原始采样率记录
-  it->second.original_frequency = pcfx->nSamplesPerSec;
+  // 更新我们保存的“原始格式”记录
+  memcpy(&it->second.original_format, pcfx, wfxSize);
 
-  // 修改采样率
+  // 修改采样率和每秒字节数
   localWfx->nSamplesPerSec =
       static_cast<DWORD>(static_cast<double>(pcfx->nSamplesPerSec) * SPEEDUP);
-
-  // nAvgBytesPerSec (每秒字节数) 也必须相应更新，否则调用会失败
   localWfx->nAvgBytesPerSec = localWfx->nSamplesPerSec * localWfx->nBlockAlign;
 
   // 限制频率在 DirectSound 支持的范围内
@@ -117,7 +201,7 @@ HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   // 调用原始的 SetFormat 函数
   HRESULT hr = it->second.SetFormat_orig(pThis, localWfx);
 
-  _freea(localWfx); // 释放栈上分配的内存
+  _freea(localWfx);
   LeaveCriticalSection(&g_cs);
   return hr;
 }
@@ -132,8 +216,9 @@ HRESULT WINAPI SetFrequency_fake(IDirectSoundBuffer *pThis, DWORD dwFrequency) {
   }
 
   DWORD baseFrequency = dwFrequency;
+  // 如果程序想恢复到原始频率，我们使用记录的原始频率作为基准
   if (dwFrequency == DSBFREQUENCY_ORIGINAL) {
-    baseFrequency = it->second.original_frequency;
+    baseFrequency = it->second.original_format.nSamplesPerSec;
   }
 
   DWORD newFrequency =
@@ -164,7 +249,7 @@ ULONG WINAPI DS_Release_fake(IDirectSound *pThis) {
   return refCount;
 }
 
-// 伪造的 IDirectSound::CreateSoundBuffer
+// [REWRITTEN] 伪造的 IDirectSound::CreateSoundBuffer - 这是核心修改
 HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
                                       LPCDSBUFFERDESC pcDSBufferDesc,
                                       LPDIRECTSOUNDBUFFER *ppDSBuffer,
@@ -175,82 +260,133 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
     LeaveCriticalSection(&g_cs);
     return DSERR_GENERIC;
   }
+  // 提前释放锁，因为原始调用可能会耗时
+  auto CreateSoundBuffer_orig = it->second.CreateSoundBuffer_orig;
   LeaveCriticalSection(&g_cs);
 
-  if (pcDSBufferDesc == nullptr || pcDSBufferDesc->dwSize == 0) {
+  if (pcDSBufferDesc == nullptr || pcDSBufferDesc->dwSize == 0 ||
+      ppDSBuffer == nullptr) {
     return DSERR_INVALIDPARAM;
   }
 
-  DSBUFFERDESC1 localDesc;
-  memset(&localDesc, 0, sizeof(DSBUFFERDESC1));
-  memcpy(&localDesc, pcDSBufferDesc, pcDSBufferDesc->dwSize);
-  localDesc.dwSize = pcDSBufferDesc->dwSize;
+  // Primary Buffer 不需要我们处理，直接调用原始函数
+  if (pcDSBufferDesc->dwFlags & DSBCAPS_PRIMARYBUFFER) {
+    return CreateSoundBuffer_orig(pThis, pcDSBufferDesc, ppDSBuffer, pUnkOuter);
+  }
 
-  // [MODIFIED] --- 关键修改：强制使用软件混音 ---
-  // 1. 强制添加频率控制能力，确保我们可以调用 SetFrequency
+  // --- 核心修改：创建修改后的描述符 ---
+  DSBUFFERDESC localDesc;
+  memcpy(&localDesc, pcDSBufferDesc, pcDSBufferDesc->dwSize);
+
+  WAVEFORMATEX original_format = {0};
+  WAVEFORMATEX *modified_format = nullptr;
+
+  if (localDesc.lpwfxFormat) {
+    // 复制原始格式，以便后续保存
+    size_t wfxSize = sizeof(WAVEFORMATEX) + localDesc.lpwfxFormat->cbSize;
+    memcpy(&original_format, localDesc.lpwfxFormat, wfxSize);
+
+    // 在栈上分配内存来存放修改后的格式
+    modified_format = (WAVEFORMATEX *)_malloca(wfxSize);
+    if (!modified_format)
+      return DSERR_OUTOFMEMORY;
+    memcpy(modified_format, localDesc.lpwfxFormat, wfxSize);
+
+    // 修改采样率和每秒字节数
+    modified_format->nSamplesPerSec = static_cast<DWORD>(
+        static_cast<double>(modified_format->nSamplesPerSec) * SPEEDUP);
+    modified_format->nAvgBytesPerSec =
+        modified_format->nSamplesPerSec * modified_format->nBlockAlign;
+
+    // 限制频率范围
+    modified_format->nSamplesPerSec =
+        max(DSBFREQUENCY_MIN, modified_format->nSamplesPerSec);
+    modified_format->nSamplesPerSec =
+        min(DSBFREQUENCY_MAX, modified_format->nSamplesPerSec);
+    modified_format->nAvgBytesPerSec =
+        modified_format->nSamplesPerSec * modified_format->nBlockAlign;
+
+    // 让我们的本地描述符指向修改后的格式
+    localDesc.lpwfxFormat = modified_format;
+  }
+
+  // 强制使用软件混音，这是实现变速变调的基础
   localDesc.dwFlags |= DSBCAPS_CTRLFREQUENCY;
-  // 2. 移除硬件缓冲区标志，因为硬件缓冲区不支持灵活的频率变换
   localDesc.dwFlags &= ~DSBCAPS_LOCHARDWARE;
-  // 3. 添加软件缓冲区标志，让CPU来处理重采样，这是实现变速的核心
   localDesc.dwFlags |= DSBCAPS_LOCSOFTWARE;
-  // 4. (可选但建议) 静态缓冲区通常也是硬件相关的，一并移除
   localDesc.dwFlags &= ~DSBCAPS_STATIC;
 
-  HRESULT hr = it->second.CreateSoundBuffer_orig(
-      pThis, (LPCDSBUFFERDESC)&localDesc, ppDSBuffer, pUnkOuter);
+  // 使用修改后的描述符调用原始函数
+  HRESULT hr = CreateSoundBuffer_orig(pThis, &localDesc, ppDSBuffer, pUnkOuter);
 
+  // 释放栈上分配的内存
+  if (modified_format) {
+    _freea(modified_format);
+  }
+
+  // 如果创建成功，Hook 新的 Buffer
   if (SUCCEEDED(hr) && ppDSBuffer && *ppDSBuffer) {
     IDirectSoundBuffer *pBuffer = *ppDSBuffer;
 
     EnterCriticalSection(&g_cs);
     if (g_dsound_buffer_hooks.count(pBuffer) == 0) {
       void **pVTable = *reinterpret_cast<void ***>(pBuffer);
-      const int vtable_size = 24; // 对于 IDirectSoundBuffer8 足够
+      // IDirectSoundBuffer8 有 24 个方法，取一个足够大的值
+      const int vtable_size = 24;
       DSoundBufferHook hook_data;
       hook_data.vtable_clone.assign(pVTable, pVTable + vtable_size);
 
+      // 保存原始函数指针
       hook_data.Release_orig =
           reinterpret_cast<decltype(hook_data.Release_orig)>(
-              hook_data.vtable_clone[IUNKNOWN_RELEASE_INDEX]);
-
-      // [MODIFIED] 获取原始的 SetFormat 函数指针
+              pVTable[IUNKNOWN_RELEASE_INDEX]);
+      hook_data.GetFormat_orig =
+          reinterpret_cast<decltype(hook_data.GetFormat_orig)>(
+              pVTable[IDIRECTSOUNDBUFFER_GETFORMAT_INDEX]);
+      hook_data.GetFrequency_orig =
+          reinterpret_cast<decltype(hook_data.GetFrequency_orig)>(
+              pVTable[IDIRECTSOUNDBUFFER_GETFREQUENCY_INDEX]);
       hook_data.SetFormat_orig =
           reinterpret_cast<decltype(hook_data.SetFormat_orig)>(
-              hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFORMAT_INDEX]);
-
+              pVTable[IDIRECTSOUNDBUFFER_SETFORMAT_INDEX]);
       hook_data.SetFrequency_orig =
           reinterpret_cast<decltype(hook_data.SetFrequency_orig)>(
-              hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX]);
+              pVTable[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX]);
 
+      // 保存原始格式
       if (pcDSBufferDesc->lpwfxFormat) {
-        hook_data.original_frequency =
-            pcDSBufferDesc->lpwfxFormat->nSamplesPerSec;
+        size_t wfxSize =
+            sizeof(WAVEFORMATEX) + pcDSBufferDesc->lpwfxFormat->cbSize;
+        memcpy(&hook_data.original_format, pcDSBufferDesc->lpwfxFormat,
+               wfxSize);
       } else {
-        hook_data.original_frequency = 0;
+        // 如果创建时没有提供格式，我们尝试获取一下（虽然不太可能）
+        hook_data.GetFormat_orig(pBuffer, &hook_data.original_format,
+                                 sizeof(WAVEFORMATEX), nullptr);
+        // 并把它降速回来作为“原始”格式
+        hook_data.original_format.nSamplesPerSec = static_cast<DWORD>(
+            static_cast<double>(hook_data.original_format.nSamplesPerSec) /
+            SPEEDUP);
+        hook_data.original_format.nAvgBytesPerSec =
+            hook_data.original_format.nSamplesPerSec *
+            hook_data.original_format.nBlockAlign;
       }
 
+      // 替换 VTable 中的函数指针
       hook_data.vtable_clone[IUNKNOWN_RELEASE_INDEX] = &DSB_Release_fake;
-      // [MODIFIED] 将 VTable 中的 SetFormat 指向我们的伪造函数
+      hook_data.vtable_clone[IDIRECTSOUNDBUFFER_GETFORMAT_INDEX] =
+          &GetFormat_fake;
+      hook_data.vtable_clone[IDIRECTSOUNDBUFFER_GETFREQUENCY_INDEX] =
+          &GetFrequency_fake;
       hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFORMAT_INDEX] =
           &SetFormat_fake;
       hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX] =
           &SetFrequency_fake;
 
+      // 存储 Hook 数据并替换 VTable
       g_dsound_buffer_hooks[pBuffer] = std::move(hook_data);
       *reinterpret_cast<void ***>(pBuffer) =
           g_dsound_buffer_hooks[pBuffer].vtable_clone.data();
-
-      // 创建成功后，立即主动设置一次加速后的频率
-      if (g_dsound_buffer_hooks[pBuffer].original_frequency > 0) {
-        DWORD newFrequency = static_cast<DWORD>(
-            static_cast<double>(
-                g_dsound_buffer_hooks[pBuffer].original_frequency) *
-            SPEEDUP);
-        newFrequency = max(DSBFREQUENCY_MIN, newFrequency);
-        newFrequency = min(DSBFREQUENCY_MAX, newFrequency);
-
-        g_dsound_buffer_hooks[pBuffer].SetFrequency_orig(pBuffer, newFrequency);
-      }
     }
     LeaveCriticalSection(&g_cs);
   }
@@ -274,10 +410,10 @@ void HookDirectSound(IUnknown *pDsound) {
   hook_data.vtable_clone.assign(pVTable, pVTable + vtable_size);
 
   hook_data.Release_orig = reinterpret_cast<decltype(hook_data.Release_orig)>(
-      hook_data.vtable_clone[IUNKNOWN_RELEASE_INDEX]);
+      pVTable[IUNKNOWN_RELEASE_INDEX]);
   hook_data.CreateSoundBuffer_orig =
       reinterpret_cast<decltype(hook_data.CreateSoundBuffer_orig)>(
-          hook_data.vtable_clone[IDIRECTSOUND_CREATESOUNDBUFFER_INDEX]);
+          pVTable[IDIRECTSOUND_CREATESOUNDBUFFER_INDEX]);
 
   hook_data.vtable_clone[IUNKNOWN_RELEASE_INDEX] = &DS_Release_fake;
   hook_data.vtable_clone[IDIRECTSOUND_CREATESOUNDBUFFER_INDEX] =
@@ -290,8 +426,7 @@ void HookDirectSound(IUnknown *pDsound) {
 
 // --- 导出的伪造函数实现 ---
 
-// 注意：FAKE 宏的定义应该在一个单独的头文件中，并确保只被包含一次
-// 这里为了完整性保留，但在实际项目中建议分离。
+// 确保 FAKE 宏定义在项目中只存在一份
 #ifndef _HOOK_MACRO_H
 #define _HOOK_MACRO_H
 
@@ -322,36 +457,59 @@ FAKE(HRESULT, WINAPI, DirectSoundCreate8, LPCGUID lpcGuidDevice,
   return hr;
 }
 
+// [MODIFIED] DirectSoundFullDuplexCreate 也需要应用完整的 Buffer Hook 逻辑
 FAKE(HRESULT, WINAPI, DirectSoundFullDuplexCreate, LPCGUID pcGuidCaptureDevice,
      LPCGUID pcGuidRenderDevice, LPCDSCBUFFERDESC pcDscBufferDesc,
      LPCDSBUFFERDESC pcDsBufferDesc, HWND hwnd, DWORD dwLevel,
      LPDIRECTSOUNDFULLDUPLEX *ppDSFD, LPDIRECTSOUNDCAPTUREBUFFER8 *ppDSCB8,
      LPDIRECTSOUNDBUFFER8 *ppDSB8, LPUNKNOWN pUnkOuter) {
 
-  DSBUFFERDESC1 localDsBufferDesc;
+  // --- 与 CreateSoundBuffer_fake 中完全相同的逻辑 ---
+  DSBUFFERDESC localDesc;
   LPCDSBUFFERDESC pModifiedDsBufferDesc = pcDsBufferDesc;
+  WAVEFORMATEX *modified_format = nullptr;
 
   if (pcDsBufferDesc && pcDsBufferDesc->dwSize > 0) {
-    memset(&localDsBufferDesc, 0, sizeof(DSBUFFERDESC1));
-    memcpy(&localDsBufferDesc, pcDsBufferDesc, pcDsBufferDesc->dwSize);
-    localDsBufferDesc.dwSize = pcDsBufferDesc->dwSize;
+    memcpy(&localDesc, pcDsBufferDesc, pcDsBufferDesc->dwSize);
 
-    // [MODIFIED] --- 对全双工创建中的缓冲区也应用相同的强制软件混音逻辑 ---
-    localDsBufferDesc.dwFlags |= DSBCAPS_CTRLFREQUENCY;
-    localDsBufferDesc.dwFlags &= ~DSBCAPS_LOCHARDWARE;
-    localDsBufferDesc.dwFlags |= DSBCAPS_LOCSOFTWARE;
-    localDsBufferDesc.dwFlags &= ~DSBCAPS_STATIC;
+    if (localDesc.lpwfxFormat) {
+      size_t wfxSize = sizeof(WAVEFORMATEX) + localDesc.lpwfxFormat->cbSize;
+      modified_format = (WAVEFORMATEX *)_malloca(wfxSize);
+      if (!modified_format)
+        return DSERR_OUTOFMEMORY;
+      memcpy(modified_format, localDesc.lpwfxFormat, wfxSize);
 
-    pModifiedDsBufferDesc = (LPCDSBUFFERDESC)&localDsBufferDesc;
+      modified_format->nSamplesPerSec = static_cast<DWORD>(
+          static_cast<double>(modified_format->nSamplesPerSec) * SPEEDUP);
+      modified_format->nAvgBytesPerSec =
+          modified_format->nSamplesPerSec * modified_format->nBlockAlign;
+      modified_format->nSamplesPerSec =
+          max(DSBFREQUENCY_MIN, modified_format->nSamplesPerSec);
+      modified_format->nSamplesPerSec =
+          min(DSBFREQUENCY_MAX, modified_format->nSamplesPerSec);
+      modified_format->nAvgBytesPerSec =
+          modified_format->nSamplesPerSec * modified_format->nBlockAlign;
+
+      localDesc.lpwfxFormat = modified_format;
+    }
+
+    localDesc.dwFlags |= DSBCAPS_CTRLFREQUENCY;
+    localDesc.dwFlags &= ~DSBCAPS_LOCHARDWARE;
+    localDesc.dwFlags |= DSBCAPS_LOCSOFTWARE;
+    localDesc.dwFlags &= ~DSBCAPS_STATIC;
+
+    pModifiedDsBufferDesc = &localDesc;
   }
 
   HRESULT hr = DirectSoundFullDuplexCreate_real(
       pcGuidCaptureDevice, pcGuidRenderDevice, pcDscBufferDesc,
-      pModifiedDsBufferDesc, // 使用修改后的描述符
-      hwnd, dwLevel, ppDSFD, ppDSCB8, ppDSB8, pUnkOuter);
+      pModifiedDsBufferDesc, hwnd, dwLevel, ppDSFD, ppDSCB8, ppDSB8, pUnkOuter);
 
-  // [MODIFIED] 对这里创建的缓冲区应用与 CreateSoundBuffer_fake 中完全相同的
-  // Hook 逻辑
+  if (modified_format) {
+    _freea(modified_format);
+  }
+
+  // 对这里创建的缓冲区应用与 CreateSoundBuffer_fake 中完全相同的 Hook 逻辑
   if (SUCCEEDED(hr) && ppDSB8 && *ppDSB8) {
     IDirectSoundBuffer *pBuffer = *ppDSB8;
 
@@ -364,24 +522,32 @@ FAKE(HRESULT, WINAPI, DirectSoundFullDuplexCreate, LPCGUID pcGuidCaptureDevice,
 
       hook_data.Release_orig =
           reinterpret_cast<decltype(hook_data.Release_orig)>(
-              hook_data.vtable_clone[IUNKNOWN_RELEASE_INDEX]);
-
+              pVTable[IUNKNOWN_RELEASE_INDEX]);
+      hook_data.GetFormat_orig =
+          reinterpret_cast<decltype(hook_data.GetFormat_orig)>(
+              pVTable[IDIRECTSOUNDBUFFER_GETFORMAT_INDEX]);
+      hook_data.GetFrequency_orig =
+          reinterpret_cast<decltype(hook_data.GetFrequency_orig)>(
+              pVTable[IDIRECTSOUNDBUFFER_GETFREQUENCY_INDEX]);
       hook_data.SetFormat_orig =
           reinterpret_cast<decltype(hook_data.SetFormat_orig)>(
-              hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFORMAT_INDEX]);
-
+              pVTable[IDIRECTSOUNDBUFFER_SETFORMAT_INDEX]);
       hook_data.SetFrequency_orig =
           reinterpret_cast<decltype(hook_data.SetFrequency_orig)>(
-              hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX]);
+              pVTable[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX]);
 
       if (pcDsBufferDesc && pcDsBufferDesc->lpwfxFormat) {
-        hook_data.original_frequency =
-            pcDsBufferDesc->lpwfxFormat->nSamplesPerSec;
-      } else {
-        hook_data.original_frequency = 0;
+        size_t wfxSize =
+            sizeof(WAVEFORMATEX) + pcDsBufferDesc->lpwfxFormat->cbSize;
+        memcpy(&hook_data.original_format, pcDsBufferDesc->lpwfxFormat,
+               wfxSize);
       }
 
       hook_data.vtable_clone[IUNKNOWN_RELEASE_INDEX] = &DSB_Release_fake;
+      hook_data.vtable_clone[IDIRECTSOUNDBUFFER_GETFORMAT_INDEX] =
+          &GetFormat_fake;
+      hook_data.vtable_clone[IDIRECTSOUNDBUFFER_GETFREQUENCY_INDEX] =
+          &GetFrequency_fake;
       hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFORMAT_INDEX] =
           &SetFormat_fake;
       hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX] =
@@ -390,16 +556,6 @@ FAKE(HRESULT, WINAPI, DirectSoundFullDuplexCreate, LPCGUID pcGuidCaptureDevice,
       g_dsound_buffer_hooks[pBuffer] = std::move(hook_data);
       *reinterpret_cast<void ***>(pBuffer) =
           g_dsound_buffer_hooks[pBuffer].vtable_clone.data();
-
-      if (g_dsound_buffer_hooks[pBuffer].original_frequency > 0) {
-        DWORD newFrequency = static_cast<DWORD>(
-            static_cast<double>(
-                g_dsound_buffer_hooks[pBuffer].original_frequency) *
-            SPEEDUP);
-        newFrequency = max(DSBFREQUENCY_MIN, newFrequency);
-        newFrequency = min(DSBFREQUENCY_MAX, newFrequency);
-        g_dsound_buffer_hooks[pBuffer].SetFrequency_orig(pBuffer, newFrequency);
-      }
     }
     LeaveCriticalSection(&g_cs);
   }
