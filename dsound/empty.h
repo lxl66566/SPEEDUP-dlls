@@ -4,13 +4,13 @@
 #include <windows.h>
 
 #include <dsound.h>
-#include <malloc.h> // For _malloca and _freea
+#include <malloc.h>
 #include <map>
 #include <utility>
 #include <vector>
 
-// --- VTable 索引 ---
-// 根据 dsound vtable 结构，添加了 GetFormat 和 GetFrequency 的索引
+#include "hook_macro.h"
+
 constexpr int IUNKNOWN_QUERYINTERFACE_INDEX = 0;
 constexpr int IUNKNOWN_ADDREF_INDEX = 1;
 constexpr int IUNKNOWN_RELEASE_INDEX = 2;
@@ -23,11 +23,6 @@ constexpr int IDIRECTSOUNDBUFFER_GETFORMAT_INDEX = 5;
 constexpr int IDIRECTSOUNDBUFFER_GETFREQUENCY_INDEX = 8;
 constexpr int IDIRECTSOUNDBUFFER_SETFORMAT_INDEX = 14;
 constexpr int IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX = 17;
-
-// --- 线程安全 ---
-CRITICAL_SECTION g_cs;
-// 在 DllMain 的 DLL_PROCESS_ATTACH 中初始化: InitializeCriticalSection(&g_cs);
-// 在 DllMain 的 DLL_PROCESS_DETACH 中销毁: DeleteCriticalSection(&g_cs);
 
 // --- 前向声明伪造函数 ---
 HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
@@ -75,10 +70,8 @@ std::map<IDirectSoundBuffer *, DSoundBufferHook> g_dsound_buffer_hooks;
 
 // 伪造的 IDirectSoundBuffer::Release
 ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis) {
-  EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
   if (it == g_dsound_buffer_hooks.end()) {
-    LeaveCriticalSection(&g_cs);
     // 可能是一个我们没有Hook的缓冲区（例如Primary Buffer），直接返回
     // 理论上不应该发生，但作为保护
     return 1;
@@ -91,7 +84,6 @@ ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis) {
   if (refCount == 0) {
     g_dsound_buffer_hooks.erase(it);
   }
-  LeaveCriticalSection(&g_cs);
   return refCount;
 }
 
@@ -99,16 +91,12 @@ ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis) {
 // 目标：向应用程序报告原始的、未经修改的音频格式
 HRESULT WINAPI GetFormat_fake(IDirectSoundBuffer *pThis, LPWAVEFORMATEX pwfx,
                               DWORD dwSizeAllocated, LPDWORD pdwSizeWritten) {
-  EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
   if (it == g_dsound_buffer_hooks.end()) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_GENERIC;
   }
 
-  // 先获取原始信息，以防万一
   DSoundBufferHook &hook_data = it->second;
-  LeaveCriticalSection(&g_cs);
 
   if (pwfx == nullptr && pdwSizeWritten == nullptr) {
     return DSERR_INVALIDPARAM;
@@ -132,26 +120,20 @@ HRESULT WINAPI GetFormat_fake(IDirectSoundBuffer *pThis, LPWAVEFORMATEX pwfx,
   return DS_OK;
 }
 
-// [NEW] 伪造的 IDirectSoundBuffer::GetFrequency
-// 目标：向应用程序报告原始的、未经修改的频率
 HRESULT WINAPI GetFrequency_fake(IDirectSoundBuffer *pThis,
                                  LPDWORD pdwFrequency) {
-  EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
   if (it == g_dsound_buffer_hooks.end()) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_GENERIC;
   }
 
   if (pdwFrequency == nullptr) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_INVALIDPARAM;
   }
 
   // 调用原始函数获取真实的、加速后的频率
   DWORD realFrequency;
   HRESULT hr = it->second.GetFrequency_orig(pThis, &realFrequency);
-  LeaveCriticalSection(&g_cs);
 
   if (SUCCEEDED(hr)) {
     // 计算出原始频率并返回
@@ -164,15 +146,12 @@ HRESULT WINAPI GetFrequency_fake(IDirectSoundBuffer *pThis,
 
 // 伪造的 IDirectSoundBuffer::SetFormat
 HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
-  EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
   if (it == g_dsound_buffer_hooks.end()) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_GENERIC;
   }
 
   if (pcfx == nullptr) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_INVALIDPARAM;
   }
 
@@ -180,7 +159,6 @@ HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   size_t wfxSize = sizeof(WAVEFORMATEX) + pcfx->cbSize;
   WAVEFORMATEX *localWfx = (WAVEFORMATEX *)_malloca(wfxSize);
   if (!localWfx) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_OUTOFMEMORY;
   }
   memcpy(localWfx, pcfx, wfxSize);
@@ -202,16 +180,13 @@ HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   HRESULT hr = it->second.SetFormat_orig(pThis, localWfx);
 
   _freea(localWfx);
-  LeaveCriticalSection(&g_cs);
   return hr;
 }
 
 // 伪造的 IDirectSoundBuffer::SetFrequency
 HRESULT WINAPI SetFrequency_fake(IDirectSoundBuffer *pThis, DWORD dwFrequency) {
-  EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
   if (it == g_dsound_buffer_hooks.end()) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_GENERIC;
   }
 
@@ -228,16 +203,13 @@ HRESULT WINAPI SetFrequency_fake(IDirectSoundBuffer *pThis, DWORD dwFrequency) {
   newFrequency = min(DSBFREQUENCY_MAX, newFrequency);
 
   HRESULT hr = it->second.SetFrequency_orig(pThis, newFrequency);
-  LeaveCriticalSection(&g_cs);
   return hr;
 }
 
 // 伪造的 IDirectSound::Release
 ULONG WINAPI DS_Release_fake(IDirectSound *pThis) {
-  EnterCriticalSection(&g_cs);
   auto it = g_dsound_hooks.find(pThis);
   if (it == g_dsound_hooks.end()) {
-    LeaveCriticalSection(&g_cs);
     return 1;
   }
 
@@ -245,7 +217,6 @@ ULONG WINAPI DS_Release_fake(IDirectSound *pThis) {
   if (refCount == 0) {
     g_dsound_hooks.erase(it);
   }
-  LeaveCriticalSection(&g_cs);
   return refCount;
 }
 
@@ -254,15 +225,11 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
                                       LPCDSBUFFERDESC pcDSBufferDesc,
                                       LPDIRECTSOUNDBUFFER *ppDSBuffer,
                                       LPUNKNOWN pUnkOuter) {
-  EnterCriticalSection(&g_cs);
   auto it = g_dsound_hooks.find(pThis);
   if (it == g_dsound_hooks.end()) {
-    LeaveCriticalSection(&g_cs);
     return DSERR_GENERIC;
   }
-  // 提前释放锁，因为原始调用可能会耗时
   auto CreateSoundBuffer_orig = it->second.CreateSoundBuffer_orig;
-  LeaveCriticalSection(&g_cs);
 
   if (pcDSBufferDesc == nullptr || pcDSBufferDesc->dwSize == 0 ||
       ppDSBuffer == nullptr) {
@@ -328,7 +295,6 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
   if (SUCCEEDED(hr) && ppDSBuffer && *ppDSBuffer) {
     IDirectSoundBuffer *pBuffer = *ppDSBuffer;
 
-    EnterCriticalSection(&g_cs);
     if (g_dsound_buffer_hooks.count(pBuffer) == 0) {
       void **pVTable = *reinterpret_cast<void ***>(pBuffer);
       // IDirectSoundBuffer8 有 24 个方法，取一个足够大的值
@@ -388,7 +354,6 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
       *reinterpret_cast<void ***>(pBuffer) =
           g_dsound_buffer_hooks[pBuffer].vtable_clone.data();
     }
-    LeaveCriticalSection(&g_cs);
   }
   return hr;
 }
@@ -398,9 +363,7 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
 void HookDirectSound(IUnknown *pDsound) {
   IDirectSound *pDS = static_cast<IDirectSound *>(pDsound);
 
-  EnterCriticalSection(&g_cs);
   if (g_dsound_hooks.count(pDS)) {
-    LeaveCriticalSection(&g_cs);
     return;
   }
 
@@ -421,24 +384,9 @@ void HookDirectSound(IUnknown *pDsound) {
 
   g_dsound_hooks[pDS] = std::move(hook_data);
   *reinterpret_cast<void ***>(pDS) = g_dsound_hooks[pDS].vtable_clone.data();
-  LeaveCriticalSection(&g_cs);
 }
 
-// --- 导出的伪造函数实现 ---
-
-// 确保 FAKE 宏定义在项目中只存在一份
-#ifndef _HOOK_MACRO_H
-#define _HOOK_MACRO_H
-
-#define DECL_FN_PTR(RETTYPE, CONVENTION, FN_NAME, ...)                         \
-  typedef RETTYPE(CONVENTION *FN_NAME##_ptr)(__VA_ARGS__)
-#define FAKE(RETTYPE, CONVENTION, FN_NAME, ...)                                \
-  DECL_FN_PTR(RETTYPE, CONVENTION, FN_NAME, __VA_ARGS__);                      \
-  FN_NAME##_ptr FN_NAME##_real;                                                \
-  RETTYPE CONVENTION FN_NAME##_fake(__VA_ARGS__)
-
-#endif
-
+#define DIRECTSOUNDCREATE
 FAKE(HRESULT, WINAPI, DirectSoundCreate, LPCGUID lpcGuidDevice,
      LPDIRECTSOUND *ppDS, LPUNKNOWN pUnkOuter) {
   HRESULT hr = DirectSoundCreate_real(lpcGuidDevice, ppDS, pUnkOuter);
@@ -448,6 +396,7 @@ FAKE(HRESULT, WINAPI, DirectSoundCreate, LPCGUID lpcGuidDevice,
   return hr;
 }
 
+#define DIRECTSOUNDCREATE8
 FAKE(HRESULT, WINAPI, DirectSoundCreate8, LPCGUID lpcGuidDevice,
      LPDIRECTSOUND8 *ppDS8, LPUNKNOWN pUnkOuter) {
   HRESULT hr = DirectSoundCreate8_real(lpcGuidDevice, ppDS8, pUnkOuter);
@@ -457,7 +406,7 @@ FAKE(HRESULT, WINAPI, DirectSoundCreate8, LPCGUID lpcGuidDevice,
   return hr;
 }
 
-// [MODIFIED] DirectSoundFullDuplexCreate 也需要应用完整的 Buffer Hook 逻辑
+#define DIRECTSOUNDFULLDUPLEXCREATE
 FAKE(HRESULT, WINAPI, DirectSoundFullDuplexCreate, LPCGUID pcGuidCaptureDevice,
      LPCGUID pcGuidRenderDevice, LPCDSCBUFFERDESC pcDscBufferDesc,
      LPCDSBUFFERDESC pcDsBufferDesc, HWND hwnd, DWORD dwLevel,
@@ -513,7 +462,6 @@ FAKE(HRESULT, WINAPI, DirectSoundFullDuplexCreate, LPCGUID pcGuidCaptureDevice,
   if (SUCCEEDED(hr) && ppDSB8 && *ppDSB8) {
     IDirectSoundBuffer *pBuffer = *ppDSB8;
 
-    EnterCriticalSection(&g_cs);
     if (g_dsound_buffer_hooks.count(pBuffer) == 0) {
       void **pVTable = *reinterpret_cast<void ***>(pBuffer);
       const int vtable_size = 24;
@@ -557,7 +505,6 @@ FAKE(HRESULT, WINAPI, DirectSoundFullDuplexCreate, LPCGUID pcGuidCaptureDevice,
       *reinterpret_cast<void ***>(pBuffer) =
           g_dsound_buffer_hooks[pBuffer].vtable_clone.data();
     }
-    LeaveCriticalSection(&g_cs);
   }
 
   return hr;
