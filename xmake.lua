@@ -1,4 +1,4 @@
-SPEEDUP = 2.0
+SPEEDUP = 2.5
 if is_arch("x64") then
 	ARCH = "x64"
 else
@@ -10,6 +10,7 @@ set_policy("build.warning", true)
 set_languages("c++20")
 set_optimize("fastest")
 -- add_requires("soundtouch", { configs = { shared = true } })
+add_requires("vcpkg::speexdsp >=1.2.0")
 
 target("mmdevapi")
 set_kind("shared")
@@ -30,3 +31,7 @@ if is_arch("x64") then
 end
 add_links("ole32", "user32", "dsound", "dxguid")
 add_defines("SPEEDUP=" .. SPEEDUP)
+if SPEEDUP > 2.0 then
+	add_defines("SPEEXDSP=1")
+	add_packages("vcpkg::speexdsp")
+end

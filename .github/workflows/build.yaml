@@ -27,6 +27,13 @@ jobs:
         with:
           xmake-version: latest
 
+      - name: Setup Vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgArguments: ""
+          vcpkgDirectory: "${{ github.workspace }}/vcpkg"
+          vcpkgGitCommitId: "44d94c2edbd44f0c01d66c2ad95eb6982a9a61bc"
+
       - name: Build loop for different SPEEDUP values
         run: |
           # 备份原始的 xmake.lua 文件
@@ -46,12 +53,12 @@ jobs:
 
             # 构建 x64 版本
             echo "Building x64 for SPEEDUP ${SPEEDUP}..."
-            xmake f -c -p windows -a x64 --toolchain=msvc
+            xmake f -c -p windows -a x64 --toolchain=msvc -y
             xmake
 
             # 构建 x86 版本
             echo "Building x86 for SPEEDUP ${SPEEDUP}..."
-            xmake f -c -p windows -a x86 --toolchain=msvc
+            xmake f -c -p windows -a x86 --toolchain=msvc -y
             xmake
           done
 
@@ -62,7 +69,7 @@ jobs:
       - uses: milliewalky/setup-7-zip@v2
       - name: Package all DLLs into a 7z archive
         run: |
-          7z a -t7z -mx=9 MMDevAPI-DLLs.7z ./build/windows/x64/release/*.dll ./build/windows/x86/release/*.dll
+          7z a -t7z -mx=9 SPEEDUP-DLLs.7z ./build/windows/x64/release/*.dll ./build/windows/x86/release/*.dll
 
       # 步骤 6: 上传构建产物 (Artifact)
       # 无论何时运行，都会执行此步骤
@@ -70,9 +77,9 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           # Artifact 的名称
-          name: MMDevAPI-DLLs
+          name: SPEEDUP-DLLs
           # 需要上传的文件的路径
-          path: MMDevAPI-DLLs.7z
+          path: SPEEDUP-DLLs.7z
 
       # 步骤 7: 如果是 tag 触发，则上传到 Release
       # 仅在事件是由一个 tag (例如 v1.0.0) 触发时运行
@@ -81,4 +88,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           # 需要上传的文件列表
-          files: MMDevAPI-DLLs.7z
+          files: SPEEDUP-DLLs.7z

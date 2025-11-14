@@ -1,15 +1,23 @@
+
 #ifndef _EMPTY_H
 #define _EMPTY_H
 
-#include <windows.h>
-
-#include "hook_macro.h"
 #include <dsound.h>
 #include <initguid.h>
 #include <malloc.h>
 #include <map>
 #include <utility>
 #include <vector>
+#include <windows.h>
+
+#include "hook_macro.h"
+
+#if SPEEXDSP
+#include <include/speex/speex_resampler.h>
+constexpr double actual_dsound_speedup = 2.0;
+#else
+constexpr double actual_dsound_speedup = SPEEDUP;
+#endif
 
 // --- VTable 索引 ---
 constexpr int IUNKNOWN_QUERYINTERFACE_INDEX = 0;
@@ -19,8 +27,10 @@ constexpr int IDIRECTSOUND_CREATESOUNDBUFFER_INDEX = 3;
 constexpr int IDIRECTSOUND_DUPLICATESOUNDBUFFER_INDEX = 5;
 constexpr int IDIRECTSOUNDBUFFER_GETFORMAT_INDEX = 5;
 constexpr int IDIRECTSOUNDBUFFER_GETFREQUENCY_INDEX = 8;
+constexpr int IDIRECTSOUNDBUFFER_LOCK_INDEX = 11;
 constexpr int IDIRECTSOUNDBUFFER_SETFORMAT_INDEX = 14;
 constexpr int IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX = 17;
+constexpr int IDIRECTSOUNDBUFFER_UNLOCK_INDEX = 19;
 
 // --- 线程安全 ---
 CRITICAL_SECTION g_cs;
@@ -49,6 +59,13 @@ HRESULT WINAPI GetFrequency_fake(IDirectSoundBuffer *pThis,
                                  LPDWORD pdwFrequency);
 HRESULT WINAPI GetFormat_fake(IDirectSoundBuffer *pThis, LPWAVEFORMATEX pwfx,
                               DWORD dwSizeAllocated, LPDWORD pdwSizeWritten);
+HRESULT WINAPI Lock_fake(IDirectSoundBuffer *pThis, DWORD dwWriteCursor,
+                         DWORD dwWriteBytes, LPVOID *ppvAudioPtr1,
+                         LPDWORD pdwAudioBytes1, LPVOID *ppvAudioPtr2,
+                         LPDWORD pdwAudioBytes2, DWORD dwFlags);
+HRESULT WINAPI Unlock_fake(IDirectSoundBuffer *pThis, LPVOID pvAudioPtr1,
+                           DWORD dwAudioBytes1, LPVOID pvAudioPtr2,
+                           DWORD dwAudioBytes2);
 ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis);
 
 // --- 用于存储 Hook 信息的结构体和全局 Map ---
@@ -69,9 +86,22 @@ struct DSoundBufferHook {
   HRESULT(WINAPI *GetFormat_orig)(IDirectSoundBuffer *, LPWAVEFORMATEX, DWORD,
                                   LPDWORD);
   HRESULT(WINAPI *GetFrequency_orig)(IDirectSoundBuffer *, LPDWORD);
+  HRESULT(WINAPI *Lock_orig)(IDirectSoundBuffer *, DWORD, DWORD, LPVOID *,
+                             LPDWORD, LPVOID *, LPDWORD, DWORD);
+  HRESULT(WINAPI *Unlock_orig)(IDirectSoundBuffer *, LPVOID, DWORD, LPVOID,
+                               DWORD);
   ULONG(WINAPI *Release_orig)(IDirectSoundBuffer *);
   WAVEFORMATEX original_format;
   std::vector<void *> vtable_clone;
+
+#if SPEEXDSP
+  SpeexResamplerState *resampler = nullptr;
+  std::vector<char> temp_lock_buffer;
+  LPVOID real_ptr1 = nullptr;
+  DWORD real_bytes1 = 0;
+  LPVOID real_ptr2 = nullptr;
+  DWORD real_bytes2 = 0;
+#endif
 };
 std::map<IDirectSoundBuffer *, DSoundBufferHook> g_dsound_buffer_hooks;
 
@@ -98,6 +128,11 @@ void HookDirectSoundBuffer(IDirectSoundBuffer *pBuffer,
     hook_data.SetFrequency_orig =
         reinterpret_cast<decltype(hook_data.SetFrequency_orig)>(
             pVTable[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX]);
+    hook_data.Lock_orig = reinterpret_cast<decltype(hook_data.Lock_orig)>(
+        pVTable[IDIRECTSOUNDBUFFER_LOCK_INDEX]);
+    hook_data.Unlock_orig = reinterpret_cast<decltype(hook_data.Unlock_orig)>(
+        pVTable[IDIRECTSOUNDBUFFER_UNLOCK_INDEX]);
+
     if (pOriginalFormat) {
       size_t wfxSize = sizeof(WAVEFORMATEX) + pOriginalFormat->cbSize;
       memcpy(&hook_data.original_format, pOriginalFormat, wfxSize);
@@ -116,6 +151,18 @@ void HookDirectSoundBuffer(IDirectSoundBuffer *pBuffer,
             hook_data.original_format.nBlockAlign;
       }
     }
+
+#if SPEEXDSP
+    if (hook_data.original_format.wFormatTag != 0) {
+      int error = 0;
+      DWORD input_rate = hook_data.original_format.nSamplesPerSec;
+      DWORD output_rate = static_cast<DWORD>(input_rate / (SPEEDUP / 2.0));
+      hook_data.resampler = speex_resampler_init(
+          hook_data.original_format.nChannels, input_rate, output_rate,
+          SPEEX_RESAMPLER_QUALITY_DEFAULT, &error);
+    }
+#endif
+
     hook_data.vtable_clone[IUNKNOWN_RELEASE_INDEX] = &DSB_Release_fake;
     hook_data.vtable_clone[IDIRECTSOUNDBUFFER_GETFORMAT_INDEX] =
         &GetFormat_fake;
@@ -125,6 +172,9 @@ void HookDirectSoundBuffer(IDirectSoundBuffer *pBuffer,
         &SetFormat_fake;
     hook_data.vtable_clone[IDIRECTSOUNDBUFFER_SETFREQUENCY_INDEX] =
         &SetFrequency_fake;
+    hook_data.vtable_clone[IDIRECTSOUNDBUFFER_LOCK_INDEX] = &Lock_fake;
+    hook_data.vtable_clone[IDIRECTSOUNDBUFFER_UNLOCK_INDEX] = &Unlock_fake;
+
     g_dsound_buffer_hooks[pBuffer] = std::move(hook_data);
     *reinterpret_cast<void ***>(pBuffer) =
         g_dsound_buffer_hooks[pBuffer].vtable_clone.data();
@@ -141,11 +191,18 @@ ULONG WINAPI DSB_Release_fake(IDirectSoundBuffer *pThis) {
     return 1;
   }
   ULONG refCount = it->second.Release_orig(pThis);
-  if (refCount == 0)
+  if (refCount == 0) {
+#if SPEEXDSP
+    if (it->second.resampler) {
+      speex_resampler_destroy(it->second.resampler);
+    }
+#endif
     g_dsound_buffer_hooks.erase(it);
+  }
   LeaveCriticalSection(&g_cs);
   return refCount;
 }
+
 HRESULT WINAPI GetFormat_fake(IDirectSoundBuffer *pThis, LPWAVEFORMATEX pwfx,
                               DWORD dwSizeAllocated, LPDWORD pdwSizeWritten) {
   EnterCriticalSection(&g_cs);
@@ -168,6 +225,7 @@ HRESULT WINAPI GetFormat_fake(IDirectSoundBuffer *pThis, LPWAVEFORMATEX pwfx,
   }
   return DS_OK;
 }
+
 HRESULT WINAPI GetFrequency_fake(IDirectSoundBuffer *pThis,
                                  LPDWORD pdwFrequency) {
   EnterCriticalSection(&g_cs);
@@ -183,11 +241,13 @@ HRESULT WINAPI GetFrequency_fake(IDirectSoundBuffer *pThis,
   DWORD realFrequency;
   HRESULT hr = it->second.GetFrequency_orig(pThis, &realFrequency);
   LeaveCriticalSection(&g_cs);
-  if (SUCCEEDED(hr))
-    *pdwFrequency =
-        static_cast<DWORD>(static_cast<double>(realFrequency) / SPEEDUP);
+  if (SUCCEEDED(hr)) {
+    *pdwFrequency = static_cast<DWORD>(static_cast<double>(realFrequency) /
+                                       actual_dsound_speedup);
+  }
   return hr;
 }
+
 HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
@@ -207,16 +267,33 @@ HRESULT WINAPI SetFormat_fake(IDirectSoundBuffer *pThis, LPCWAVEFORMATEX pcfx) {
   }
   memcpy(localWfx, pcfx, wfxSize);
   memcpy(&it->second.original_format, pcfx, wfxSize);
-  localWfx->nSamplesPerSec =
-      static_cast<DWORD>(static_cast<double>(pcfx->nSamplesPerSec) * SPEEDUP);
+
+  localWfx->nSamplesPerSec = static_cast<DWORD>(
+      static_cast<double>(pcfx->nSamplesPerSec) * actual_dsound_speedup);
   localWfx->nSamplesPerSec =
       max(DSBFREQUENCY_MIN, min(DSBFREQUENCY_MAX, localWfx->nSamplesPerSec));
   localWfx->nAvgBytesPerSec = localWfx->nSamplesPerSec * localWfx->nBlockAlign;
   HRESULT hr = it->second.SetFormat_orig(pThis, localWfx);
   _freea(localWfx);
+
+#if SPEEXDSP
+  // Re-initialize resampler
+  if (it->second.resampler) {
+    speex_resampler_destroy(it->second.resampler);
+    it->second.resampler = nullptr;
+  }
+  int error = 0;
+  DWORD input_rate = it->second.original_format.nSamplesPerSec;
+  DWORD output_rate = static_cast<DWORD>(input_rate / (SPEEDUP / 2.0));
+  it->second.resampler = speex_resampler_init(
+      it->second.original_format.nChannels, input_rate, output_rate,
+      SPEEX_RESAMPLER_QUALITY_DEFAULT, &error);
+#endif
+
   LeaveCriticalSection(&g_cs);
   return hr;
 }
+
 HRESULT WINAPI SetFrequency_fake(IDirectSoundBuffer *pThis, DWORD dwFrequency) {
   EnterCriticalSection(&g_cs);
   auto it = g_dsound_buffer_hooks.find(pThis);
@@ -227,13 +304,177 @@ HRESULT WINAPI SetFrequency_fake(IDirectSoundBuffer *pThis, DWORD dwFrequency) {
   DWORD baseFrequency = (dwFrequency == DSBFREQUENCY_ORIGINAL)
                             ? it->second.original_format.nSamplesPerSec
                             : dwFrequency;
-  DWORD newFrequency =
-      static_cast<DWORD>(static_cast<double>(baseFrequency) * SPEEDUP);
+
+  DWORD newFrequency = static_cast<DWORD>(static_cast<double>(baseFrequency) *
+                                          actual_dsound_speedup);
   newFrequency = max(DSBFREQUENCY_MIN, min(DSBFREQUENCY_MAX, newFrequency));
   HRESULT hr = it->second.SetFrequency_orig(pThis, newFrequency);
   LeaveCriticalSection(&g_cs);
   return hr;
 }
+
+#if SPEEXDSP
+HRESULT WINAPI Lock_fake(IDirectSoundBuffer *pThis, DWORD dwWriteCursor,
+                         DWORD dwWriteBytes, LPVOID *ppvAudioPtr1,
+                         LPDWORD pdwAudioBytes1, LPVOID *ppvAudioPtr2,
+                         LPDWORD pdwAudioBytes2, DWORD dwFlags) {
+  EnterCriticalSection(&g_cs);
+  auto it = g_dsound_buffer_hooks.find(pThis);
+  if (it == g_dsound_buffer_hooks.end()) {
+    LeaveCriticalSection(&g_cs);
+    return DSERR_GENERIC;
+  }
+  DSoundBufferHook &hook_data = it->second;
+
+  // 先调用原始 Lock，获取真实的缓冲区指针，但我们不把它们返回给应用程序
+  HRESULT hr = hook_data.Lock_orig(pThis, dwWriteCursor, dwWriteBytes,
+                                   &hook_data.real_ptr1, &hook_data.real_bytes1,
+                                   &hook_data.real_ptr2, &hook_data.real_bytes2,
+                                   dwFlags);
+
+  if (FAILED(hr)) {
+    LeaveCriticalSection(&g_cs);
+    return hr;
+  }
+
+  // 调整我们自己的临时缓冲区大小，以匹配应用程序的请求
+  try {
+    hook_data.temp_lock_buffer.resize(dwWriteBytes);
+  } catch (const std::bad_alloc &) {
+    // 内存分配失败，解锁真实缓冲区并返回错误
+    hook_data.Unlock_orig(pThis, hook_data.real_ptr1, 0, hook_data.real_ptr2,
+                          0);
+    LeaveCriticalSection(&g_cs);
+    return DSERR_OUTOFMEMORY;
+  }
+
+  // 将应用程序的指针重定向到我们的临时缓冲区
+  *ppvAudioPtr1 = hook_data.temp_lock_buffer.data();
+  *pdwAudioBytes1 = dwWriteBytes;
+  *ppvAudioPtr2 = nullptr;
+  *pdwAudioBytes2 = 0;
+
+  LeaveCriticalSection(&g_cs);
+  return DS_OK;
+}
+
+HRESULT WINAPI Unlock_fake(IDirectSoundBuffer *pThis, LPVOID pvAudioPtr1,
+                           DWORD dwAudioBytes1, LPVOID pvAudioPtr2,
+                           DWORD dwAudioBytes2) {
+  EnterCriticalSection(&g_cs);
+  auto it = g_dsound_buffer_hooks.find(pThis);
+  if (it == g_dsound_buffer_hooks.end()) {
+    LeaveCriticalSection(&g_cs);
+    return DSERR_GENERIC;
+  }
+  DSoundBufferHook &hook_data = it->second;
+
+  if (!hook_data.resampler || hook_data.temp_lock_buffer.empty() ||
+      pvAudioPtr1 != hook_data.temp_lock_buffer.data()) {
+    // 如果状态不匹配，可能不是通过我们的 Lock_fake 锁定的，直接调用原始 Unlock
+    LeaveCriticalSection(&g_cs);
+    return hook_data.Unlock_orig(pThis, pvAudioPtr1, dwAudioBytes1, pvAudioPtr2,
+                                 dwAudioBytes2);
+  }
+
+  // --- 执行重采样 ---
+  const WAVEFORMATEX &fmt = hook_data.original_format;
+  if (fmt.nBlockAlign == 0) { // 防止除零
+    hook_data.Unlock_orig(pThis, hook_data.real_ptr1, 0, hook_data.real_ptr2,
+                          0);
+    LeaveCriticalSection(&g_cs);
+    return DSERR_GENERIC;
+  }
+
+  spx_uint32_t in_len = dwAudioBytes1 / fmt.nBlockAlign;
+  spx_uint32_t out_len = static_cast<spx_uint32_t>(
+      ceil(static_cast<double>(in_len) / (SPEEDUP / 2.0)));
+
+  std::vector<char> resampled_buffer(out_len * fmt.nBlockAlign);
+
+  int result = -1;
+  if (fmt.wBitsPerSample == 16) {
+    result = speex_resampler_process_interleaved_int(
+        hook_data.resampler, reinterpret_cast<const spx_int16_t *>(pvAudioPtr1),
+        &in_len, reinterpret_cast<spx_int16_t *>(resampled_buffer.data()),
+        &out_len);
+  } else if (fmt.wBitsPerSample == 8) {
+    // Speex 需要 16 位数据，所以我们先进行转换
+    std::vector<spx_int16_t> temp_16bit(in_len * fmt.nChannels);
+    for (size_t i = 0; i < in_len * fmt.nChannels; ++i) {
+      // 从 8-bit unsigned (0-255) 转换到 16-bit signed (-32768 to 32767)
+      temp_16bit[i] = (static_cast<const uint8_t *>(pvAudioPtr1)[i] - 128) << 8;
+    }
+    std::vector<spx_int16_t> resampled_16bit(out_len * fmt.nChannels);
+    result = speex_resampler_process_interleaved_int(
+        hook_data.resampler, temp_16bit.data(), &in_len, resampled_16bit.data(),
+        &out_len);
+
+    // 将结果转换回 8 位
+    for (size_t i = 0; i < out_len * fmt.nChannels; ++i) {
+      resampled_buffer[i] = static_cast<char>((resampled_16bit[i] >> 8) + 128);
+    }
+  }
+  // 可以为其他格式（如 32-bit float）添加更多处理
+
+  DWORD resampled_bytes = out_len * fmt.nBlockAlign;
+
+  // 将重采样后的数据写入真实的 DirectSound 缓冲区
+  DWORD bytes_to_write1 = min(resampled_bytes, hook_data.real_bytes1);
+  memcpy(hook_data.real_ptr1, resampled_buffer.data(), bytes_to_write1);
+
+  DWORD bytes_to_write2 = 0;
+  if (resampled_bytes > bytes_to_write1 && hook_data.real_ptr2) {
+    bytes_to_write2 =
+        min(resampled_bytes - bytes_to_write1, hook_data.real_bytes2);
+    memcpy(hook_data.real_ptr2, resampled_buffer.data() + bytes_to_write1,
+           bytes_to_write2);
+  }
+
+  // 使用真实指针和重采样后的大小来调用原始 Unlock
+  HRESULT hr =
+      hook_data.Unlock_orig(pThis, hook_data.real_ptr1, bytes_to_write1,
+                            hook_data.real_ptr2, bytes_to_write2);
+
+  // 清理状态
+  hook_data.real_ptr1 = nullptr;
+  hook_data.real_bytes1 = 0;
+  hook_data.real_ptr2 = nullptr;
+  hook_data.real_bytes2 = 0;
+  hook_data.temp_lock_buffer.clear();
+
+  LeaveCriticalSection(&g_cs);
+  return hr;
+}
+#else
+// 当 SPEEDUP <= 2.0 时，Lock 和 Unlock 保持原样，不需要 hook
+HRESULT WINAPI Lock_fake(IDirectSoundBuffer *pThis, DWORD dwWriteCursor,
+                         DWORD dwWriteBytes, LPVOID *ppvAudioPtr1,
+                         LPDWORD pdwAudioBytes1, LPVOID *ppvAudioPtr2,
+                         LPDWORD pdwAudioBytes2, DWORD dwFlags) {
+  EnterCriticalSection(&g_cs);
+  auto it = g_dsound_buffer_hooks.find(pThis);
+  LeaveCriticalSection(&g_cs);
+  if (it == g_dsound_buffer_hooks.end())
+    return DSERR_GENERIC;
+  return it->second.Lock_orig(pThis, dwWriteCursor, dwWriteBytes, ppvAudioPtr1,
+                              pdwAudioBytes1, ppvAudioPtr2, pdwAudioBytes2,
+                              dwFlags);
+}
+
+HRESULT WINAPI Unlock_fake(IDirectSoundBuffer *pThis, LPVOID pvAudioPtr1,
+                           DWORD dwAudioBytes1, LPVOID pvAudioPtr2,
+                           DWORD dwAudioBytes2) {
+  EnterCriticalSection(&g_cs);
+  auto it = g_dsound_buffer_hooks.find(pThis);
+  LeaveCriticalSection(&g_cs);
+  if (it == g_dsound_buffer_hooks.end())
+    return DSERR_GENERIC;
+  return it->second.Unlock_orig(pThis, pvAudioPtr1, dwAudioBytes1, pvAudioPtr2,
+                                dwAudioBytes2);
+}
+#endif
+
 ULONG WINAPI DS_Release_fake(IDirectSound *pThis) {
   EnterCriticalSection(&g_cs);
   auto it = g_dsound_hooks.find(pThis);
@@ -247,6 +488,7 @@ ULONG WINAPI DS_Release_fake(IDirectSound *pThis) {
   LeaveCriticalSection(&g_cs);
   return refCount;
 }
+
 HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
                                       LPCDSBUFFERDESC pcDSBufferDesc,
                                       LPDIRECTSOUNDBUFFER *ppDSBuffer,
@@ -274,7 +516,8 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
       return DSERR_OUTOFMEMORY;
     memcpy(modified_format, localDesc.lpwfxFormat, wfxSize);
     modified_format->nSamplesPerSec = static_cast<DWORD>(
-        static_cast<double>(modified_format->nSamplesPerSec) * SPEEDUP);
+        static_cast<double>(modified_format->nSamplesPerSec) *
+        actual_dsound_speedup);
     modified_format->nSamplesPerSec =
         max(DSBFREQUENCY_MIN,
             min(DSBFREQUENCY_MAX, modified_format->nSamplesPerSec));
@@ -291,6 +534,7 @@ HRESULT WINAPI CreateSoundBuffer_fake(IDirectSound *pThis,
     HookDirectSoundBuffer(*ppDSBuffer, pcDSBufferDesc->lpwfxFormat);
   return hr;
 }
+
 HRESULT WINAPI DuplicateSoundBuffer_fake(
     IDirectSound *pThis, IDirectSoundBuffer *pDSBufferOriginal,
     IDirectSoundBuffer **ppDSBufferDuplicate) {
